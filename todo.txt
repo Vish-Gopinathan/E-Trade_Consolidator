@@ -1,0 +1,7 @@
+- Desipher Json responses for account
+- get df for one position
+- get df for all positions in a portfolio
+
+-Get df for all portfolios
+- consolidation script
+-excel print
