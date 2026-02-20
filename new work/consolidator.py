@@ -273,46 +273,64 @@ def add_totals_row(consolidated_df):
     
     return consolidated_df
 
-# Add the new transaction functions from new.py
+# Transaction type constants
+TRADE_TYPES = ['Bought', 'Sold']
+CASH_FLOW_TYPES = ['Electronic Funds Transfer', 'Check', 'Transfer', 'Journal', 'Dividend',
+                   'Interest', 'Contribution', 'Distribution', 'Wire', 'ACH']
+
 def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_date):
     """
-    Retrieves and consolidates transaction data into a Pandas DataFrame.
+    Retrieves all transactions for one account into a single DataFrame.
+
+    Includes both trade transactions (Bought/Sold) and cash flow transactions
+    (deposits, withdrawals, transfers). All rows share the same schema; columns
+    that don't apply to a given transaction type are left as None.
+
+    Columns returned:
+        Date             - transaction date
+        Security Name    - description from API
+        Quantity         - shares (trades only)
+        Price            - price per share (trades only)
+        Total Value      - total dollar amount (positive = money in, negative = money out)
+        Transaction Type - original type string from API
+        Category         - 'Trade', 'Deposit', 'Withdrawal', or 'Other'
 
     Args:
-        accounts_obj: An instance of the API wrapper object with list_transactions and list_transaction_details methods.
-        account_id_key: The unique identifier for the brokerage account.
-        start_date: The start date for the transaction history (datetime.date object).
-        end_date: The end date for the transaction history (datetime.date object).
+        accounts_obj: pyetrade.ETradeAccounts instance.
+        account_id_key: Unique account identifier string.
+        start_date: datetime.date — start of range (inclusive).
+        end_date: datetime.date — end of range (inclusive).
 
     Returns:
-        A Pandas DataFrame containing the consolidated transaction data.
+        pandas.DataFrame of all transactions, sorted newest-first.
     """
-    # Ensure both dates are datetime.date objects
     if not isinstance(start_date, datetime.date):
         raise TypeError("start_date must be a datetime.date object")
     if not isinstance(end_date, datetime.date):
         raise TypeError("end_date must be a datetime.date object")
-        
+
     transaction_list_response = accounts_obj.list_transactions(account_id_key, start_date, end_date)
     transactions = transaction_list_response.get('TransactionListResponse', {}).get('Transaction', [])
 
     if not transactions:
         return pd.DataFrame()
-        
+
     transaction_data = []
     for transaction in transactions:
-        if transaction['transactionType'] in ['Bought', 'Sold']:
+        t_type = transaction.get('transactionType', '')
+        t_date = pd.to_datetime(transaction['transactionDate'], unit='ms')
+        description = transaction.get('description', '')
+        amount = transaction.get('amount')  # top-level amount field present on all transaction types
+
+        if t_type in TRADE_TYPES:
+            # Trades: fetch details for quantity and price
             transaction_id = transaction['transactionId']
-            transaction_details_response = accounts_obj.list_transaction_details(account_id_key, transaction_id)
-            transaction_details = transaction_details_response.get('TransactionDetailsResponse', {}).get('Brokerage', {})
-            product_info = transaction.get('brokerage', {}).get('product', {})
+            details_response = accounts_obj.list_transaction_details(account_id_key, transaction_id)
+            details = details_response.get('TransactionDetailsResponse', {}).get('Brokerage', {})
 
-            transaction_date = pd.to_datetime(transaction['transactionDate'], unit='ms')
-            security_name = transaction['description']
-            quantity = transaction_details.get('quantity')
-            price = transaction_details.get('price')
+            quantity = details.get('quantity')
+            price = details.get('price')
 
-            # Ensure quantity and price are not None before calculating total value
             if quantity is not None and price is not None:
                 try:
                     quantity = float(quantity)
@@ -321,57 +339,143 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
                 except ValueError:
                     total_value = None
             else:
-                total_value = None
+                total_value = float(amount) if amount is not None else None
 
             transaction_data.append({
-                'Date': transaction_date,
-                'Security Name': security_name,
+                'Date': t_date,
+                'Security Name': description,
                 'Quantity': quantity,
                 'Price': price,
                 'Total Value': total_value,
-                'Transaction Type': transaction['transactionType']
+                'Transaction Type': t_type,
+                'Category': 'Trade'
             })
 
+        elif t_type in CASH_FLOW_TYPES or _is_cash_flow(t_type, description):
+            # Cash flows: no quantity/price, use the top-level amount directly.
+            # Deposits are positive; withdrawals/distributions are negative.
+            try:
+                dollar_amount = float(amount) if amount is not None else None
+            except (ValueError, TypeError):
+                dollar_amount = None
+
+            category = _classify_cash_flow(t_type, dollar_amount)
+
+            transaction_data.append({
+                'Date': t_date,
+                'Security Name': description,
+                'Quantity': None,
+                'Price': None,
+                'Total Value': dollar_amount,
+                'Transaction Type': t_type,
+                'Category': category
+            })
+
+    if not transaction_data:
+        return pd.DataFrame()
+
     df = pd.DataFrame(transaction_data)
+    df = df.sort_values('Date', ascending=False).reset_index(drop=True)
     return df
+
+
+def _is_cash_flow(t_type, description):
+    """
+    Catch-all for cash flow types not in the explicit CASH_FLOW_TYPES list.
+    E*TRADE occasionally uses non-standard type strings.
+    """
+    cash_keywords = ['deposit', 'withdrawal', 'transfer', 'contribution',
+                     'distribution', 'wire', 'ach', 'journal']
+    combined = (t_type + ' ' + description).lower()
+    return any(kw in combined for kw in cash_keywords)
+
+
+def _classify_cash_flow(t_type, amount):
+    """
+    Return 'Deposit', 'Withdrawal', or 'Other' based on type and sign of amount.
+    """
+    t_lower = t_type.lower()
+    deposit_types = ['electronic funds transfer', 'contribution', 'ach', 'wire', 'check']
+    withdrawal_types = ['distribution']
+
+    if any(d in t_lower for d in deposit_types):
+        return 'Deposit' if (amount is None or amount >= 0) else 'Withdrawal'
+    if any(w in t_lower for w in withdrawal_types):
+        return 'Withdrawal'
+    if amount is not None:
+        return 'Deposit' if amount >= 0 else 'Withdrawal'
+    return 'Other'
 
 def get_all_consolidated_transactions(accounts_obj, active_accounts, start_date, end_date):
     """
-    Get all transactions across all accounts.
-    
+    Get all transactions (trades + cash flows) across all active accounts.
+
     Args:
         accounts_obj: E*TRADE Accounts object
         active_accounts: DataFrame of active accounts
         start_date: Start date for transaction history (datetime.date object)
         end_date: End date for transaction history (datetime.date object)
-        
+
     Returns:
-        DataFrame: Combined transactions from all accounts
+        DataFrame: Combined transactions from all accounts, sorted newest-first.
+                   Columns: Date, Security Name, Quantity, Price, Total Value,
+                             Transaction Type, Category
     """
-    # Ensure dates are datetime.date objects
     if not isinstance(start_date, datetime.date):
         raise TypeError("start_date must be a datetime.date object")
     if not isinstance(end_date, datetime.date):
         raise TypeError("end_date must be a datetime.date object")
-        
+
     out = pd.DataFrame()
     for key in active_accounts['accountIdKey']:
         account_transactions = get_consolidated_transactions(accounts_obj, key, start_date, end_date)
         out = pd.concat([out, account_transactions])
 
-    # Sort by date with most recent first
     if not out.empty:
         out = out.sort_values('Date', ascending=False).reset_index(drop=True)
-        
+
     return out
 
-def export_to_excel(consolidated_df, transactions_df=None, filename=None, summary_spacing=3):
+
+def get_cash_flows(transaction_df):
+    """
+    Extract deposit and withdrawal rows from a full transaction DataFrame.
+
+    This is a convenience filter over the output of get_all_consolidated_transactions.
+    It returns only rows where Category is 'Deposit' or 'Withdrawal', which are
+    the inputs needed for deposit-adjusted return calculations (Modified Dietz).
+
+    Args:
+        transaction_df: DataFrame returned by get_all_consolidated_transactions.
+
+    Returns:
+        DataFrame with columns: Date, Description, Total Value, Category
+        Positive Total Value = money coming into the portfolio (deposit).
+        Negative Total Value = money leaving the portfolio (withdrawal).
+        Returns empty DataFrame if no cash flow rows exist.
+    """
+    if transaction_df.empty or 'Category' not in transaction_df.columns:
+        return pd.DataFrame(columns=['Date', 'Description', 'Total Value', 'Category'])
+
+    cash_flows = transaction_df[transaction_df['Category'].isin(['Deposit', 'Withdrawal'])].copy()
+
+    if cash_flows.empty:
+        return pd.DataFrame(columns=['Date', 'Description', 'Total Value', 'Category'])
+
+    result = cash_flows[['Date', 'Security Name', 'Total Value', 'Category']].copy()
+    result = result.rename(columns={'Security Name': 'Description'})
+    result = result.sort_values('Date', ascending=False).reset_index(drop=True)
+    return result
+
+def export_to_excel(consolidated_df, transactions_df=None, cash_flows_df=None,
+                    filename=None, summary_spacing=3):
     """
     Export consolidated holdings DataFrame to an Excel file with formatting.
-    
+
     Parameters:
     consolidated_df (pandas.DataFrame): Consolidated holdings DataFrame
-    transactions_df (pandas.DataFrame, optional): Transactions DataFrame to include
+    transactions_df (pandas.DataFrame, optional): Full transactions DataFrame (trades + cash flows)
+    cash_flows_df (pandas.DataFrame, optional): Deposit/withdrawal rows for the Cash Flows sheet
     filename (str, optional): Name of the Excel file to save
     summary_spacing (int, optional): Number of blank rows before the summary section
     """
@@ -542,7 +646,71 @@ def export_to_excel(consolidated_df, transactions_df=None, filename=None, summar
             for i, col in enumerate(transactions_df.columns):
                 column_len = max(transactions_df[col].astype(str).map(len).max(), len(col))
                 trans_worksheet.set_column(i, i, column_len + 2)
-    
+
+        # Add Cash Flows sheet if cash flow data is provided
+        if cash_flows_df is not None and not cash_flows_df.empty:
+            cash_flows_df.to_excel(writer, sheet_name='Cash Flows', index=False)
+
+            cf_worksheet = writer.sheets['Cash Flows']
+
+            # Header formatting
+            for col_num, value in enumerate(cash_flows_df.columns.values):
+                cf_worksheet.write(0, col_num, value, header_format)
+
+            # Date and currency formatting
+            date_format = workbook.add_format({'num_format': 'yyyy-mm-dd'})
+            cf_worksheet.set_column('A:A', 14, date_format)   # Date
+
+            # Colour-code rows: green for deposits, red for withdrawals
+            green_format = workbook.add_format({
+                'bg_color': '#E2EFDA', 'border': 1, 'num_format': '$#,##0.00', 'align': 'right'
+            })
+            red_format = workbook.add_format({
+                'bg_color': '#FCE4D6', 'border': 1, 'num_format': '$#,##0.00', 'align': 'right'
+            })
+
+            value_col_idx = list(cash_flows_df.columns).index('Total Value')
+            category_col_idx = list(cash_flows_df.columns).index('Category')
+
+            for row_idx, (_, row) in enumerate(cash_flows_df.iterrows(), start=1):
+                fmt = green_format if row.get('Category') == 'Deposit' else red_format
+                val = row['Total Value']
+                if val is not None:
+                    try:
+                        cf_worksheet.write(row_idx, value_col_idx, float(val), fmt)
+                    except (ValueError, TypeError):
+                        cf_worksheet.write(row_idx, value_col_idx, str(val), fmt)
+
+            # Summary rows below the data
+            summary_start = len(cash_flows_df) + 2
+            cf_worksheet.write(summary_start, 0, "SUMMARY", header_format)
+            cf_worksheet.write(summary_start, 1, '', header_format)
+
+            deposits = cash_flows_df[cash_flows_df['Category'] == 'Deposit']['Total Value']
+            withdrawals = cash_flows_df[cash_flows_df['Category'] == 'Withdrawal']['Total Value']
+            total_dep = pd.to_numeric(deposits, errors='coerce').sum()
+            total_with = pd.to_numeric(withdrawals, errors='coerce').sum()
+
+            total_row_format = workbook.add_format({
+                'bold': True, 'bg_color': '#E6F2FF', 'border': 1
+            })
+            total_row_currency_format = workbook.add_format({
+                'bold': True, 'bg_color': '#E6F2FF', 'num_format': '$#,##0.00',
+                'align': 'right', 'border': 1
+            })
+
+            cf_worksheet.write(summary_start + 1, 0, "Total Deposited", total_row_format)
+            cf_worksheet.write(summary_start + 1, 1, total_dep, total_row_currency_format)
+            cf_worksheet.write(summary_start + 2, 0, "Total Withdrawn", total_row_format)
+            cf_worksheet.write(summary_start + 2, 1, abs(total_with), total_row_currency_format)
+            cf_worksheet.write(summary_start + 3, 0, "Net Cash Flow", total_row_format)
+            cf_worksheet.write(summary_start + 3, 1, total_dep + total_with, total_row_currency_format)
+
+            # Auto-adjust column widths
+            for i, col in enumerate(cash_flows_df.columns):
+                column_len = max(cash_flows_df[col].astype(str).map(len).max(), len(col))
+                cf_worksheet.set_column(i, i, column_len + 2)
+
     print(f"Portfolio exported successfully to {filename}")
 
 def main():

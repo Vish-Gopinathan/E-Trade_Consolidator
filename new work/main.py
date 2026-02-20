@@ -9,7 +9,8 @@ from consolidator import (
     consolidate_holdings,
     portfolio_summary,
     export_to_excel,
-    get_all_consolidated_transactions
+    get_all_consolidated_transactions,
+    get_cash_flows
 )
 from analytics import PortfolioAnalytics, export_analytics_to_excel
 
@@ -80,6 +81,13 @@ def main():
 
         print(f"   Fetching transactions from {start_date} to {end_date}...")
         transaction_data = get_all_consolidated_transactions(accounts_obj, active_accounts, start_date, end_date)
+        cash_flow_data = get_cash_flows(transaction_data)
+
+        if not cash_flow_data.empty:
+            deposits = cash_flow_data[cash_flow_data['Category'] == 'Deposit']['Total Value'].sum()
+            withdrawals = cash_flow_data[cash_flow_data['Category'] == 'Withdrawal']['Total Value'].sum()
+            print(f"   Found {len(cash_flow_data)} cash flow(s): "
+                  f"${deposits:,.2f} deposited, ${abs(withdrawals):,.2f} withdrawn")
 
         # Build output paths
         output_dir = args.output_dir
@@ -90,7 +98,8 @@ def main():
 
         # Export consolidated portfolio
         print("[3/4] Exporting consolidated portfolio...")
-        export_to_excel(consolidated_portfolio, transaction_data, filename=holdings_file)
+        export_to_excel(consolidated_portfolio, transaction_data,
+                        cash_flows_df=cash_flow_data, filename=holdings_file)
 
         print("\n" + "=" * 60)
         print("PORTFOLIO SUMMARY")
@@ -110,7 +119,7 @@ def main():
         print("[4/4] GENERATING ANALYTICS & RISK METRICS")
         print("=" * 60)
 
-        analytics = PortfolioAnalytics(consolidated_portfolio, transaction_data)
+        analytics = PortfolioAnalytics(consolidated_portfolio, transaction_data, cash_flow_data)
         full_report = analytics.generate_full_report()
 
         # Export analytics to separate Excel file
