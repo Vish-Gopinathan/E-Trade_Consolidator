@@ -37,8 +37,11 @@ Output files land in whatever directory the script is run from. This is fine int
 ### `portfolio_summary` "Largest Holdings" key prints awkwardly in terminal
 Fixed in `main.py`, but the `portfolio_summary` return value itself contains a list-of-dicts under `'Largest Holdings'`. Any caller that just iterates `summary.items()` and prints will get a raw Python object. Consider returning formatted strings there, or splitting the key into three separate top-holding keys.
 
+### ~~Deposit-adjusted returns (Modified Dietz)~~ ✓ Fixed
+`performance_metrics()` now includes a deposit-adjusted return using the Modified Dietz method. Cash deposits and withdrawals are captured from the transaction API, weighted by when in the period they occurred, and factored out of the return calculation so contributions are not mistaken for investment gains. Also see `cash_flow_summary()` for a standalone deposit/withdrawal breakdown.
+
 ### Realized gain calculation is wrong
-`performance_metrics()` calculates "realized gain" as the total dollar value of all sell transactions, not as profit from those sells. The actual realized gain is `(sell price - cost basis) * quantity`. Without the cost basis for each sold lot, the number is meaningless and misleading.
+`performance_metrics()` previously calculated "realized gain" as the total dollar value of all sell transactions, not as profit from those sells. That field has been removed; the deposit-adjusted return now serves as the primary performance metric when cash flow data is available.
 
 ### `add_totals_row` is never called from `main.py`
 The function exists in `consolidator.py` and is exported but `main.py` never calls it. The totals row only appears in the Excel summary section, not in the holdings table itself. Either remove the function or wire it in.

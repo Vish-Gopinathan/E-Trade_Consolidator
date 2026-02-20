@@ -38,20 +38,34 @@ class PortfolioAnalytics:
     Comprehensive portfolio analytics and risk metrics.
     """
     
-    def __init__(self, consolidated_df, transactions_df=None, risk_free_rate=0.04):
+    def __init__(self, consolidated_df, transactions_df=None, cash_flows_df=None, risk_free_rate=0.04):
         """
         Initialize portfolio analytics.
-        
+
         Parameters:
-        consolidated_df: Consolidated holdings DataFrame
-        transactions_df: Transaction history DataFrame
-        risk_free_rate: Annual risk-free rate for Sharpe ratio (default 4%)
+        consolidated_df:  Consolidated holdings DataFrame from consolidate_holdings()
+        transactions_df:  Full transaction history DataFrame (trades + cash flows)
+                          from get_all_consolidated_transactions()
+        cash_flows_df:    Deposit/withdrawal rows only, from get_cash_flows().
+                          If None, derived automatically from transactions_df.
+        risk_free_rate:   Annual risk-free rate for Sharpe/Sortino ratios (default 4%)
         """
         self.holdings = consolidated_df[consolidated_df['Symbol'] != 'CASH'].copy()
         self.cash = consolidated_df[consolidated_df['Symbol'] == 'CASH']['Market Value'].values
         self.cash = self.cash[0] if len(self.cash) > 0 else 0
         self.transactions = transactions_df if transactions_df is not None else pd.DataFrame()
         self.risk_free_rate = risk_free_rate
+
+        # Cash flows: use explicit argument if provided, otherwise derive from transactions
+        if cash_flows_df is not None:
+            self.cash_flows = cash_flows_df
+        elif not self.transactions.empty and 'Category' in self.transactions.columns:
+            cf = self.transactions[self.transactions['Category'].isin(['Deposit', 'Withdrawal'])].copy()
+            self.cash_flows = cf[['Date', 'Security Name', 'Total Value', 'Category']].rename(
+                columns={'Security Name': 'Description'}
+            ) if not cf.empty else pd.DataFrame()
+        else:
+            self.cash_flows = pd.DataFrame()
         
     def concentration_analysis(self):
         """
@@ -129,39 +143,128 @@ class PortfolioAnalytics:
     
     def performance_metrics(self):
         """
-        Calculate key performance metrics.
-        
+        Calculate key performance metrics including deposit-adjusted return.
+
+        Simple return uses cost basis from the holdings DataFrame.
+        Deposit-adjusted return uses the Modified Dietz method, which accounts
+        for the timing of cash deposits and withdrawals so that contributions
+        are not mistaken for investment gains.
+
+        Modified Dietz formula:
+            R = (EMV - BMV - CF) / (BMV + sum(CF_i * W_i))
+        where:
+            EMV  = ending market value (current portfolio value incl. cash)
+            BMV  = beginning market value (approximated as total cost basis)
+            CF   = net cash flows (deposits - withdrawals) over the period
+            W_i  = weight of each cash flow = (T - t_i) / T
+                   T = total days in period, t_i = days elapsed at flow date
+
         Returns:
         dict: Performance metrics
         """
         total_cost = self.holdings['Total Cost'].sum()
-        total_market_value = self.holdings['Market Value'].sum()
-        total_gain = self.holdings['Total Gain'].sum()
-        
-        # Overall return
-        total_return_pct = (total_gain / total_cost * 100) if total_cost > 0 else 0
-        
-        # Realized vs Unrealized (based on transactions if available)
-        if not self.transactions.empty:
-            sold_transactions = self.transactions[self.transactions['Transaction Type'] == 'Sold']
-            realized_gain = sold_transactions['Total Value'].sum() if len(sold_transactions) > 0 else 0
-        else:
-            realized_gain = 0
-        
-        unrealized_gain = total_gain - realized_gain
-        
-        # Avg cost per dollar invested
-        avg_investment = total_cost / len(self.holdings) if len(self.holdings) > 0 else 0
-        
-        return {
+        total_market_value = self.holdings['Market Value'].sum() + self.cash
+        total_gain = total_market_value - total_cost
+
+        # Simple return (cost-basis based)
+        simple_return_pct = (total_gain / total_cost * 100) if total_cost > 0 else 0
+
+        result = {
             'Total Return ($)': round(total_gain, 2),
-            'Total Return (%)': round(total_return_pct, 2),
-            'Unrealized Gain ($)': round(unrealized_gain, 2),
-            'Realized Gain ($)': round(realized_gain, 2),
+            'Total Return (%)': round(simple_return_pct, 2),
             'Total Cost Basis': round(total_cost, 2),
             'Current Market Value': round(total_market_value, 2),
-            'Avg Cost Per Position': round(avg_investment, 2)
+            'Avg Cost Per Position': round(total_cost / len(self.holdings), 2) if len(self.holdings) > 0 else 0,
         }
+
+        # Modified Dietz deposit-adjusted return
+        if not self.cash_flows.empty:
+            cf = self.cash_flows.copy()
+            cf['Total Value'] = pd.to_numeric(cf['Total Value'], errors='coerce').fillna(0)
+
+            # Deposits are positive; withdrawals should already be negative
+            # (enforced by _classify_cash_flow). Force withdrawals negative just in case.
+            cf.loc[cf['Category'] == 'Withdrawal', 'Total Value'] = \
+                -cf.loc[cf['Category'] == 'Withdrawal', 'Total Value'].abs()
+
+            total_deposits = cf.loc[cf['Category'] == 'Deposit', 'Total Value'].sum()
+            total_withdrawals = cf.loc[cf['Category'] == 'Withdrawal', 'Total Value'].sum()  # negative
+            net_cash_flow = total_deposits + total_withdrawals  # deposits - |withdrawals|
+
+            # Date range: oldest cash flow to today
+            cf['Date'] = pd.to_datetime(cf['Date'])
+            period_start = cf['Date'].min()
+            period_end = pd.Timestamp.now()
+            total_days = max((period_end - period_start).days, 1)
+
+            # Weighted cash flows: weight = fraction of period remaining after flow
+            cf['Days Elapsed'] = (cf['Date'] - period_start).dt.days
+            cf['Weight'] = (total_days - cf['Days Elapsed']) / total_days
+            weighted_cf = (cf['Total Value'] * cf['Weight']).sum()
+
+            # BMV approximated as total cost basis (we don't have a snapshot of
+            # portfolio value at period start, so cost basis is the best proxy)
+            bmv = total_cost
+            denominator = bmv + weighted_cf
+
+            if denominator != 0:
+                modified_dietz_return = (total_market_value - bmv - net_cash_flow) / denominator * 100
+            else:
+                modified_dietz_return = 0
+
+            result['Total Deposits'] = round(total_deposits, 2)
+            result['Total Withdrawals'] = round(abs(total_withdrawals), 2)
+            result['Net Cash Flows'] = round(net_cash_flow, 2)
+            result['Deposit-Adjusted Return (%)'] = round(modified_dietz_return, 2)
+            result['Deposit-Adjusted Return Note'] = (
+                'Modified Dietz method. BMV approximated as total cost basis.'
+            )
+        else:
+            result['Total Deposits'] = 0
+            result['Total Withdrawals'] = 0
+            result['Net Cash Flows'] = 0
+            result['Deposit-Adjusted Return (%)'] = 'N/A - no cash flow data'
+
+        return result
+
+    def cash_flow_summary(self):
+        """
+        Summarise deposit and withdrawal activity.
+
+        Returns:
+        dict: Cash flow metrics, or a message if no data is available.
+        """
+        if self.cash_flows.empty:
+            return {'Message': 'No cash flow data available'}
+
+        cf = self.cash_flows.copy()
+        cf['Total Value'] = pd.to_numeric(cf['Total Value'], errors='coerce').fillna(0)
+        cf.loc[cf['Category'] == 'Withdrawal', 'Total Value'] = \
+            -cf.loc[cf['Category'] == 'Withdrawal', 'Total Value'].abs()
+
+        deposits = cf[cf['Category'] == 'Deposit']
+        withdrawals = cf[cf['Category'] == 'Withdrawal']
+
+        total_deposited = deposits['Total Value'].sum()
+        total_withdrawn = abs(withdrawals['Total Value'].sum())
+        net = total_deposited - total_withdrawn
+
+        result = {
+            'Number of Deposits': len(deposits),
+            'Total Deposited': round(total_deposited, 2),
+            'Number of Withdrawals': len(withdrawals),
+            'Total Withdrawn': round(total_withdrawn, 2),
+            'Net Cash Flow': round(net, 2),
+        }
+
+        if not deposits.empty:
+            result['Largest Deposit'] = round(deposits['Total Value'].max(), 2)
+            result['Most Recent Deposit'] = str(deposits['Date'].max().date())
+        if not withdrawals.empty:
+            result['Largest Withdrawal'] = round(abs(withdrawals['Total Value'].min()), 2)
+            result['Most Recent Withdrawal'] = str(withdrawals['Date'].max().date())
+
+        return result
     
     def risk_metrics(self):
         """
@@ -317,6 +420,7 @@ class PortfolioAnalytics:
             'Concentration Analysis': self.concentration_analysis(),
             'Sector Analysis': self.sector_analysis(),
             'Performance Metrics': self.performance_metrics(),
+            'Cash Flow Summary': self.cash_flow_summary(),
             'Risk Metrics': self.risk_metrics(),
             'Liquidity Analysis': self.liquidity_analysis(),
             'Holdings Quality': self.holdings_quality_analysis(),
