@@ -1,8 +1,37 @@
+import json
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
+# Default sector mappings used when sectors.json is not present.
+# To customise, edit sectors.json in the same directory as this file.
+_DEFAULT_SECTOR_GROUPS = {
+    'Tech': ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA', 'TSLA', 'AMD', 'INTC'],
+    'Finance': ['JPM', 'BAC', 'WFC', 'GS', 'BLK', 'SCHW'],
+    'Healthcare': ['JNJ', 'UNH', 'PFE', 'ABBV', 'MRK', 'LLY'],
+    'Consumer': ['WMT', 'HD', 'MCD', 'COST', 'AMZN'],
+    'Energy': ['XOM', 'CVX', 'COP', 'MPC'],
+    'Utilities': ['DUK', 'NEE', 'SO'],
+    'ETFs/Index': ['SPY', 'IVV', 'VOO', 'QQQ', 'VTI', 'AGG', 'BND']
+}
+
+def _load_sector_groups():
+    """
+    Load sector mappings from sectors.json in the same directory as this file.
+    Falls back to _DEFAULT_SECTOR_GROUPS if the file is missing or invalid.
+    """
+    sectors_path = os.path.join(os.path.dirname(__file__), 'sectors.json')
+    try:
+        with open(sectors_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return _DEFAULT_SECTOR_GROUPS
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"Warning: could not load sectors.json ({e}), using built-in defaults.")
+        return _DEFAULT_SECTOR_GROUPS
 
 class PortfolioAnalytics:
     """
@@ -75,16 +104,7 @@ class PortfolioAnalytics:
         Returns:
         dict: Sector concentration metrics
         """
-        # Group by first character/pattern to identify sector-like patterns
-        sector_groups = {
-            'Tech': ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA', 'TSLA', 'AMD', 'INTC'],
-            'Finance': ['JPM', 'BAC', 'WFC', 'GS', 'BLK', 'SCHW'],
-            'Healthcare': ['JNJ', 'UNH', 'PFE', 'ABBV', 'MRK', 'LLY'],
-            'Consumer': ['WMT', 'HD', 'MCD', 'COST', 'AMZN'],
-            'Energy': ['XOM', 'CVX', 'COP', 'MPC'],
-            'Utilities': ['DUK', 'NEE', 'SO'],
-            'ETFs/Index': ['SPY', 'IVV', 'VOO', 'QQQ', 'VTI', 'AGG', 'BND']
-        }
+        sector_groups = _load_sector_groups()
         
         sector_allocation = {}
         for sector, symbols in sector_groups.items():
@@ -268,23 +288,23 @@ class PortfolioAnalytics:
             'Major Loss (< -50%)': len(self.holdings[self.holdings['Total Gain %'] < -50])
         }
         
-        # Find best and worst performers
-        best_performer = self.holdings.loc[self.holdings['Total Gain %'].idxmax()]
-        worst_performer = self.holdings.loc[self.holdings['Total Gain %'].idxmin()]
-        
-        return {
-            'Holdings Quality Distribution': quality_metrics,
-            'Best Performer': {
+        result = {'Holdings Quality Distribution': quality_metrics}
+
+        if not self.holdings.empty:
+            best_performer = self.holdings.loc[self.holdings['Total Gain %'].idxmax()]
+            worst_performer = self.holdings.loc[self.holdings['Total Gain %'].idxmin()]
+            result['Best Performer'] = {
                 'Symbol': best_performer['Symbol'],
                 'Gain %': round(best_performer['Total Gain %'], 2),
                 'Market Value': round(best_performer['Market Value'], 2)
-            },
-            'Worst Performer': {
+            }
+            result['Worst Performer'] = {
                 'Symbol': worst_performer['Symbol'],
                 'Gain %': round(worst_performer['Total Gain %'], 2),
                 'Market Value': round(worst_performer['Market Value'], 2)
             }
-        }
+
+        return result
     
     def generate_full_report(self):
         """
@@ -361,17 +381,43 @@ def export_analytics_to_excel(consolidated_df, analytics_report, filename=None):
             summary_sheet.write(row, 0, section_name, section_format)
             summary_sheet.write(row, 1, '', section_format)
             row += 1
-            
+
             if isinstance(section_data, dict):
                 for key, value in section_data.items():
-                    if isinstance(value, (dict, list)):
+                    if isinstance(value, dict):
+                        # Write the sub-section label, then each key/value on its own row indented
                         summary_sheet.write(row, 0, key, data_format)
-                        summary_sheet.write(row, 1, str(value), data_format)
+                        summary_sheet.write(row, 1, '', data_format)
+                        row += 1
+                        for sub_key, sub_value in value.items():
+                            summary_sheet.write(row, 0, f'    {sub_key}', data_format)
+                            if isinstance(sub_value, (int, float)):
+                                summary_sheet.write(row, 1, sub_value, data_format)
+                            else:
+                                summary_sheet.write(row, 1, str(sub_value), data_format)
+                            row += 1
+                    elif isinstance(value, list):
+                        summary_sheet.write(row, 0, key, data_format)
+                        summary_sheet.write(row, 1, '', data_format)
+                        row += 1
+                        for item in value:
+                            if isinstance(item, dict):
+                                for sub_key, sub_value in item.items():
+                                    summary_sheet.write(row, 0, f'    {sub_key}', data_format)
+                                    if isinstance(sub_value, (int, float)):
+                                        summary_sheet.write(row, 1, sub_value, data_format)
+                                    else:
+                                        summary_sheet.write(row, 1, str(sub_value), data_format)
+                                    row += 1
+                            else:
+                                summary_sheet.write(row, 0, '', data_format)
+                                summary_sheet.write(row, 1, str(item), data_format)
+                                row += 1
                     else:
                         summary_sheet.write(row, 0, key, data_format)
                         summary_sheet.write(row, 1, value, data_format)
-                    row += 1
-            
+                        row += 1
+
             row += 1
         
         summary_sheet.set_column(0, 0, 30)

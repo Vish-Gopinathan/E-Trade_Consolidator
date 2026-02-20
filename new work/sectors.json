@@ -1,0 +1,13 @@
+{
+  "Tech": ["AAPL", "MSFT", "GOOGL", "GOOG", "META", "NVDA", "TSLA", "AMD", "INTC", "ORCL", "CRM", "ADBE", "QCOM", "TXN", "AVGO", "MU", "AMAT", "KLAC", "LRCX", "NOW", "SNOW", "NET", "PLTR", "UBER", "LYFT", "SHOP", "SQ", "PYPL"],
+  "Finance": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "C", "USB", "PNC", "AXP", "COF", "V", "MA", "BRK.B", "MET", "PRU", "AFL", "CB", "AIG"],
+  "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "MRK", "LLY", "TMO", "ABT", "DHR", "BMY", "AMGN", "GILD", "ISRG", "CVS", "CI", "HUM", "BIIB", "REGN", "VRTX", "ZTS"],
+  "Consumer": ["WMT", "HD", "MCD", "COST", "AMZN", "TGT", "LOW", "NKE", "SBUX", "TJX", "MO", "PM", "KO", "PEP", "PG", "CL", "EL", "MDLZ", "KHC", "GIS"],
+  "Energy": ["XOM", "CVX", "COP", "MPC", "PSX", "VLO", "SLB", "EOG", "PXD", "DVN", "OXY", "HAL", "BKR", "KMI", "WMB"],
+  "Utilities": ["DUK", "NEE", "SO", "D", "EXC", "AEP", "SRE", "PCG", "XEL", "ES", "AWK", "ED", "ETR"],
+  "Real Estate": ["AMT", "PLD", "CCI", "EQIX", "PSA", "O", "WELL", "DLR", "SPG", "AVB", "EQR", "VICI"],
+  "Industrials": ["HON", "UPS", "UNP", "BA", "CAT", "DE", "GE", "MMM", "RTX", "LMT", "NOC", "GD", "FDX", "EMR", "ITW", "PH", "ROK", "IR"],
+  "Materials": ["LIN", "APD", "ECL", "SHW", "PPG", "NEM", "FCX", "NUE", "VMC", "MLM", "CF", "MOS"],
+  "Communications": ["NFLX", "DIS", "CMCSA", "T", "VZ", "CHTR", "TMUS", "PARA", "WBD", "EA", "TTWO", "ATVI"],
+  "ETFs/Index": ["SPY", "IVV", "VOO", "QQQ", "VTI", "AGG", "BND", "GLD", "SLV", "VEA", "VWO", "EFA", "EEM", "IWM", "IJH", "IJR", "VUG", "VTV", "ARKK", "XLK", "XLF", "XLV", "XLE", "XLI", "XLP", "XLU", "XLY", "XLRE"]
+}
