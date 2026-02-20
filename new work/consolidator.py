@@ -95,7 +95,8 @@ def get_portfolio(accounts_obj, account_id_key):
     port = accounts_obj.get_account_portfolio(account_id_key, resp_format='json', view='Complete')
     
     # Extract portfolio data
-    data = eval(str(port['PortfolioResponse']['AccountPortfolio']))[0]
+    account_portfolio = port['PortfolioResponse']['AccountPortfolio']
+    data = account_portfolio[0] if isinstance(account_portfolio, list) else account_portfolio
     positions = data['Position']
     
     # Extract detailed position information
@@ -264,11 +265,11 @@ def add_totals_row(consolidated_df):
         'Percent of Portfolio': [100.0]
     })
     
-    # If cash exists, add it to the final DataFrame
+    # Rebuild: stocks + totals row, then re-append cash at the end if present
     if not cash_row.empty:
-        consolidated_df = pd.concat([consolidated_df, totals_row, cash_row], ignore_index=True)
+        consolidated_df = pd.concat([stock_df, totals_row, cash_row], ignore_index=True)
     else:
-        consolidated_df = pd.concat([consolidated_df, totals_row], ignore_index=True)
+        consolidated_df = pd.concat([stock_df, totals_row], ignore_index=True)
     
     return consolidated_df
 
@@ -401,8 +402,12 @@ def export_to_excel(consolidated_df, transactions_df=None, filename=None, summar
             'align': 'right'
         })
         
+        # Data columns store whole-number percentages (e.g. 21.47 means 21.47%).
+        # Excel's '0.00%' format multiplies by 100, so we use '0.00' with the
+        # column header making the unit clear. The summary section divides by 100
+        # before writing and correctly uses '0.00%' there.
         percent_format = workbook.add_format({
-            'num_format': '0.00%',
+            'num_format': '0.00',
             'align': 'right'
         })
         
@@ -573,7 +578,7 @@ def main():
         # Get transaction data for the last month using datetime.date objects
         today = datetime.date.today()
         # Start from the first day of the previous month
-        start_date = datetime.date(2025,1,1)#(today.year, today.month-1 if today.month > 1 else 12, 1)
+        start_date = datetime.date(2025, 1, 1)
         end_date = today
         
         print(f"Fetching transactions from {start_date} to {end_date}...")
@@ -589,7 +594,7 @@ def main():
         
         print(f"\nTransactions: Retrieved {len(transaction_data)} transactions from the last month")
 
-        from portfolio_analytics import PortfolioAnalytics, export_analytics_to_excel
+        from analytics import PortfolioAnalytics, export_analytics_to_excel
 
         # After you have consolidated_portfolio and transaction_data
         analytics = PortfolioAnalytics(consolidated_portfolio, transaction_data)

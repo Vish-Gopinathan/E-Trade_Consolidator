@@ -12,7 +12,6 @@
 - [Data Flow](#data-flow)
 - [Excel Output Format](#excel-output-format)
 - [Analytics Engine](#analytics-engine)
-- [Enhanced Versions](#enhanced-versions)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
 
@@ -36,15 +35,14 @@ A Python application that consolidates investment holdings across multiple E-Tra
 
 ## Architecture
 
-The project has three implementation tiers:
+The project has two implementation tiers:
 
 | Tier | Location | Purpose |
 |------|----------|---------|
 | **Original** | `Portfolio Consolidator.py` | Single-file script, self-contained |
 | **Modular** | `new work/` | Refactored into separate modules with analytics |
-| **Enhanced** | `Modified/` | Advanced analysis with historical prices and charts |
 
-The **modular** version (`new work/`) is the recommended entry point for development. The original script works identically but keeps everything in one file.
+The **modular** version (`new work/`) is the recommended entry point. It separates concerns into distinct modules and adds the analytics engine. The original script is functionally identical but keeps everything in one file.
 
 ---
 
@@ -53,25 +51,17 @@ The **modular** version (`new work/`) is the recommended entry point for develop
 ```
 E-Trade consolidator/
 ├── Portfolio Consolidator.py       # Original single-file implementation
-├── Portfolio_consolidator.ipynb    # Initial prototyping notebook
+├── GUIDE.md                        # This file
 ├── .env                            # API credentials (gitignored)
 ├── .gitignore                      # Excludes secrets and outputs
-├── todo.txt                        # Development notes
 │
-├── new work/                       # Modular refactor (recommended)
-│   ├── main.py                     # Orchestrator entry point
-│   ├── consolidator.py             # Core data retrieval and consolidation
-│   └── analytics.py                # Portfolio analytics engine
-│
-├── Modified/                       # Enhanced analysis variants
-│   ├── Portfolio_Analyzer_Historical.py    # Yahoo Finance historical analysis
-│   ├── Portfolio_Consolidator_Enhanced.py  # Transaction-based analysis
-│   ├── requirements.txt                    # Python dependencies
-│   └── *.md                                # Various documentation files
-│
-└── outputs/                        # Generated Excel reports (gitignored)
-    └── portfolio_consolidated_YYYY-MM-DD.xlsx
+└── new work/                       # Modular refactor (recommended)
+    ├── main.py                     # Orchestrator entry point
+    ├── consolidator.py             # Core data retrieval and consolidation
+    └── analytics.py                # Portfolio analytics engine
 ```
+
+Output files (`.xlsx`) are written to the working directory from which the script is run.
 
 ---
 
@@ -83,30 +73,25 @@ E-Trade consolidator/
 
 ### Dependencies
 
-Install from the requirements file:
+Install individually:
 
 ```bash
-pip install -r Modified/requirements.txt
+pip install pyetrade pandas numpy xlsxwriter python-dotenv
 ```
 
-Or install individually:
-
-```
-pyetrade>=1.0.0          # E-Trade API wrapper
-pandas>=1.3.0            # Data manipulation
-numpy>=1.20.0            # Numerical operations
-xlsxwriter>=3.0.0        # Excel file generation
-python-dotenv>=0.19.0    # .env file loading
-matplotlib>=3.5.0        # Charts (enhanced versions)
-yfinance>=0.2.0          # Historical prices (enhanced versions)
-python-dateutil>=2.8.0   # Date parsing
-```
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `pyetrade` | >=1.0.0 | E-Trade API wrapper |
+| `pandas` | >=1.3.0 | Data manipulation |
+| `numpy` | >=1.20.0 | Numerical operations |
+| `xlsxwriter` | >=3.0.0 | Excel file generation |
+| `python-dotenv` | >=0.19.0 | `.env` file loading |
 
 ---
 
 ## Setup
 
-### 1. Clone and enter the project
+### 1. Enter the project directory
 
 ```bash
 cd "E-Trade consolidator"
@@ -122,7 +107,7 @@ source .venv/bin/activate   # macOS/Linux
 ### 3. Install dependencies
 
 ```bash
-pip install -r Modified/requirements.txt
+pip install pyetrade pandas numpy xlsxwriter python-dotenv
 ```
 
 ### 4. Configure API credentials
@@ -174,6 +159,8 @@ Two Excel files are generated in the working directory:
 ## Module Reference
 
 ### `consolidator.py` / `Portfolio Consolidator.py`
+
+These two files contain identical logic. `consolidator.py` is imported by `new work/main.py`; `Portfolio Consolidator.py` runs standalone.
 
 #### `authenticate_etrade() -> dict`
 
@@ -260,7 +247,11 @@ Separates holdings from the CASH row internally. All methods return plain dicts.
 #### `concentration_analysis() -> dict`
 
 Measures portfolio diversification:
-- **HHI Score**: Herfindahl-Hirschman Index (sum of squared allocation percentages). Range 0-10000. Below 1500 = well diversified.
+- **HHI Score**: Herfindahl-Hirschman Index (sum of squared allocation percentages). Range 0-10000.
+  - < 1500: Well Diversified
+  - < 2500: Moderately Diversified
+  - < 5000: Concentrated
+  - >= 5000: Highly Concentrated
 - **Effective Positions**: `10000 / HHI`. Represents how many equally-weighted positions the portfolio behaves like.
 - **Top N Holdings %**: Concentration of top 3, 5, and 10 positions.
 - **Diversification Score**: Ratio of actual to effective positions.
@@ -269,7 +260,7 @@ Measures portfolio diversification:
 
 Maps symbols to predefined sector groups (Tech, Finance, Healthcare, Consumer, Energy, Utilities, ETFs). Returns dollar and percentage allocation per sector. Unmatched symbols go to "Other".
 
-Note: Sector mappings are hardcoded. You may need to update them if your portfolio contains symbols not in the lists.
+Note: Sector mappings are hardcoded. Update the `sector_groups` dictionary in `sector_analysis()` if your portfolio contains symbols not in the default lists.
 
 #### `performance_metrics() -> dict`
 
@@ -287,11 +278,16 @@ Note: Sector mappings are hardcoded. You may need to update them if your portfol
 - **Sharpe Ratio**: `(avg_return - risk_free_rate) / volatility`
 - **Sortino Ratio**: `(avg_return - risk_free_rate) / downside_deviation`
 
-Note: These ratios are simplified -- calculated from position-level gain percentages rather than time-series returns.
+Note: These ratios use position-level gain percentages rather than time-series returns (simplified approach).
 
 #### `liquidity_analysis() -> dict`
 
-Evaluates cash position. Returns cash balance, percentage, and a liquidity score (65-85 scale based on cash percentage thresholds).
+Evaluates cash position. Returns cash balance, percentage, and a liquidity score (65-85 scale):
+- > 30% cash: 85
+- > 20% cash: 80
+- > 10% cash: 75
+- > 5% cash: 70
+- Otherwise: 65
 
 #### `transaction_analysis() -> dict`
 
@@ -300,8 +296,8 @@ Counts buys/sells, total amounts, portfolio turnover, and average transaction si
 #### `holdings_quality_analysis() -> dict`
 
 Categorizes positions into gain/loss buckets:
-- Highly Profitable (>50%), Profitable (0-50%), Breakeven
-- Small Loss (-10% to 0%), Moderate Loss (-50% to -10%), Major Loss (<-50%)
+- Highly Profitable (> 50%), Profitable (0-50%), Breakeven
+- Small Loss (-10% to 0%), Moderate Loss (-50% to -10%), Major Loss (< -50%)
 
 Identifies best and worst performers.
 
@@ -311,7 +307,11 @@ Runs all analysis methods and returns a combined dictionary.
 
 #### `export_analytics_to_excel(consolidated_df, analytics_report, filename=None)`
 
-Writes the analytics report to a formatted Excel file with an "Analytics Summary" sheet and a "Holdings Detail" sheet.
+Writes the analytics report to a formatted Excel file with two sheets:
+- **Analytics Summary**: Key-value pairs for all metrics
+- **Holdings Detail**: Full position data with performance columns
+
+Default filename: `portfolio_analytics_YYYY-MM-DD.xlsx`
 
 ---
 
@@ -390,40 +390,13 @@ Written as key-value pairs: Total Stocks, Total Quantity, Total Cost, Total Mark
 
 ---
 
-## Enhanced Versions
+## Analytics Engine
 
-The `Modified/` directory contains two advanced scripts:
+The `analytics.py` module provides seven analytical perspectives on the consolidated portfolio. It is only available when running the modular version (`new work/main.py`).
 
-### Portfolio_Analyzer_Historical.py
+All methods can be run individually or via `generate_full_report()`, which returns a combined dict. The results are written to `portfolio_analytics_YYYY-MM-DD.xlsx` with an Analytics Summary sheet and a Holdings Detail sheet.
 
-Uses **Yahoo Finance** (`yfinance`) to fetch historical price data and reconstruct daily/monthly portfolio values. This approach is more reliable than the transaction API because it:
-
-- Does not depend on E-Trade's transaction endpoint
-- Calculates true daily/monthly portfolio values
-- Provides time-series risk metrics (drawdowns, rolling volatility)
-- Generates multi-panel matplotlib charts
-
-Best for: Ongoing performance monitoring and historical trend analysis.
-
-### Portfolio_Consolidator_Enhanced.py
-
-An enhanced transaction-based analysis that:
-
-- Fixes a date handling bug where `str` objects were passed instead of `datetime.date`
-- Supports the **Modified Dietz method** for returns calculation
-- Accounts for deposits and withdrawals when calculating performance
-- Separates investment gains from contribution effects
-
-Best for: Precise return attribution when you need to distinguish market gains from cash inflows/outflows.
-
-### Which to Use
-
-| Need | Use |
-|------|-----|
-| Basic monthly snapshot | `Portfolio Consolidator.py` or `new work/main.py` |
-| Analytics and risk metrics | `new work/main.py` |
-| Historical trends and charts | `Modified/Portfolio_Analyzer_Historical.py` |
-| Deposit-adjusted returns | `Modified/Portfolio_Consolidator_Enhanced.py` |
+The analytics engine is read-only and does not call any external APIs. It works entirely from the consolidated DataFrame produced by `consolidator.py`.
 
 ---
 
