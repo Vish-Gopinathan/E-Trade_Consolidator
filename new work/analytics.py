@@ -1,0 +1,393 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+class PortfolioAnalytics:
+    """
+    Comprehensive portfolio analytics and risk metrics.
+    """
+    
+    def __init__(self, consolidated_df, transactions_df=None, risk_free_rate=0.04):
+        """
+        Initialize portfolio analytics.
+        
+        Parameters:
+        consolidated_df: Consolidated holdings DataFrame
+        transactions_df: Transaction history DataFrame
+        risk_free_rate: Annual risk-free rate for Sharpe ratio (default 4%)
+        """
+        self.holdings = consolidated_df[consolidated_df['Symbol'] != 'CASH'].copy()
+        self.cash = consolidated_df[consolidated_df['Symbol'] == 'CASH']['Market Value'].values
+        self.cash = self.cash[0] if len(self.cash) > 0 else 0
+        self.transactions = transactions_df if transactions_df is not None else pd.DataFrame()
+        self.risk_free_rate = risk_free_rate
+        
+    def concentration_analysis(self):
+        """
+        Analyze portfolio concentration and diversification.
+        
+        Returns:
+        dict: Concentration metrics
+        """
+        pct_of_portfolio = self.holdings['Percent of Portfolio'].values
+        
+        # Herfindahl-Hirschman Index (HHI) - measures concentration
+        # HHI ranges from 1/N to 10000. Lower is more diversified
+        hhi = (pct_of_portfolio ** 2).sum()
+        
+        # Effective number of positions
+        effective_positions = 10000 / hhi if hhi > 0 else len(self.holdings)
+        
+        # Top 10 concentration
+        sorted_pct = np.sort(pct_of_portfolio)[::-1]
+        top_10_pct = sorted_pct[:10].sum()
+        top_5_pct = sorted_pct[:5].sum()
+        top_3_pct = sorted_pct[:3].sum()
+        
+        return {
+            'HHI Score': round(hhi, 2),
+            'HHI Interpretation': self._interpret_hhi(hhi),
+            'Effective Positions': round(effective_positions, 2),
+            'Total Positions': len(self.holdings),
+            'Top 3 Holdings %': round(top_3_pct, 2),
+            'Top 5 Holdings %': round(top_5_pct, 2),
+            'Top 10 Holdings %': round(top_10_pct, 2),
+            'Diversification Score': round((len(self.holdings) / effective_positions) * 100, 2)
+        }
+    
+    def _interpret_hhi(self, hhi):
+        """Interpret HHI concentration score."""
+        if hhi < 1500:
+            return "Well Diversified"
+        elif hhi < 2500:
+            return "Moderately Diversified"
+        elif hhi < 5000:
+            return "Concentrated"
+        else:
+            return "Highly Concentrated"
+    
+    def sector_analysis(self):
+        """
+        Basic sector-style analysis based on holdings.
+        
+        Returns:
+        dict: Sector concentration metrics
+        """
+        # Group by first character/pattern to identify sector-like patterns
+        sector_groups = {
+            'Tech': ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA', 'TSLA', 'AMD', 'INTC'],
+            'Finance': ['JPM', 'BAC', 'WFC', 'GS', 'BLK', 'SCHW'],
+            'Healthcare': ['JNJ', 'UNH', 'PFE', 'ABBV', 'MRK', 'LLY'],
+            'Consumer': ['WMT', 'HD', 'MCD', 'COST', 'AMZN'],
+            'Energy': ['XOM', 'CVX', 'COP', 'MPC'],
+            'Utilities': ['DUK', 'NEE', 'SO'],
+            'ETFs/Index': ['SPY', 'IVV', 'VOO', 'QQQ', 'VTI', 'AGG', 'BND']
+        }
+        
+        sector_allocation = {}
+        for sector, symbols in sector_groups.items():
+            sector_values = self.holdings[self.holdings['Symbol'].isin(symbols)]['Market Value'].sum()
+            if sector_values > 0:
+                sector_allocation[sector] = round(sector_values, 2)
+        
+        # Unclassified
+        classified_symbols = [s for symbols in sector_groups.values() for s in symbols]
+        unclassified = self.holdings[~self.holdings['Symbol'].isin(classified_symbols)]['Market Value'].sum()
+        if unclassified > 0:
+            sector_allocation['Other'] = round(unclassified, 2)
+        
+        # Calculate percentages
+        total = sum(sector_allocation.values())
+        sector_allocation_pct = {k: round((v/total)*100, 2) for k, v in sector_allocation.items()}
+        
+        return {
+            'Sector Allocation ($)': sector_allocation,
+            'Sector Allocation (%)': sector_allocation_pct
+        }
+    
+    def performance_metrics(self):
+        """
+        Calculate key performance metrics.
+        
+        Returns:
+        dict: Performance metrics
+        """
+        total_cost = self.holdings['Total Cost'].sum()
+        total_market_value = self.holdings['Market Value'].sum()
+        total_gain = self.holdings['Total Gain'].sum()
+        
+        # Overall return
+        total_return_pct = (total_gain / total_cost * 100) if total_cost > 0 else 0
+        
+        # Realized vs Unrealized (based on transactions if available)
+        if not self.transactions.empty:
+            sold_transactions = self.transactions[self.transactions['Transaction Type'] == 'Sold']
+            realized_gain = sold_transactions['Total Value'].sum() if len(sold_transactions) > 0 else 0
+        else:
+            realized_gain = 0
+        
+        unrealized_gain = total_gain - realized_gain
+        
+        # Avg cost per dollar invested
+        avg_investment = total_cost / len(self.holdings) if len(self.holdings) > 0 else 0
+        
+        return {
+            'Total Return ($)': round(total_gain, 2),
+            'Total Return (%)': round(total_return_pct, 2),
+            'Unrealized Gain ($)': round(unrealized_gain, 2),
+            'Realized Gain ($)': round(realized_gain, 2),
+            'Total Cost Basis': round(total_cost, 2),
+            'Current Market Value': round(total_market_value, 2),
+            'Avg Cost Per Position': round(avg_investment, 2)
+        }
+    
+    def risk_metrics(self):
+        """
+        Calculate portfolio risk metrics.
+        
+        Returns:
+        dict: Risk metrics
+        """
+        gains_pct = self.holdings['Total Gain %'].values
+        
+        # Standard deviation of returns
+        std_dev = np.std(gains_pct) if len(gains_pct) > 1 else 0
+        
+        # Downside deviation (only negative returns)
+        downside_returns = gains_pct[gains_pct < 0]
+        downside_dev = np.std(downside_returns) if len(downside_returns) > 0 else 0
+        
+        # Winning vs losing positions
+        winning_positions = len(gains_pct[gains_pct > 0])
+        losing_positions = len(gains_pct[gains_pct < 0])
+        breakeven_positions = len(gains_pct[gains_pct == 0])
+        
+        # Win rate
+        win_rate = (winning_positions / len(gains_pct) * 100) if len(gains_pct) > 0 else 0
+        
+        # Max gain and loss
+        max_gain = gains_pct.max()
+        max_loss = gains_pct.min()
+        
+        # Sharpe ratio (simplified - uses return %, not precise)
+        avg_return = gains_pct.mean()
+        sharpe_ratio = (avg_return - (self.risk_free_rate * 100)) / std_dev if std_dev > 0 else 0
+        
+        # Sortino ratio (uses downside deviation)
+        sortino_ratio = (avg_return - (self.risk_free_rate * 100)) / downside_dev if downside_dev > 0 else 0
+        
+        return {
+            'Volatility (Std Dev %)': round(std_dev, 2),
+            'Downside Deviation %': round(downside_dev, 2),
+            'Winning Positions': winning_positions,
+            'Losing Positions': losing_positions,
+            'Breakeven Positions': breakeven_positions,
+            'Win Rate (%)': round(win_rate, 2),
+            'Best Performer (%)': round(max_gain, 2),
+            'Worst Performer (%)': round(max_loss, 2),
+            'Sharpe Ratio': round(sharpe_ratio, 2),
+            'Sortino Ratio': round(sortino_ratio, 2)
+        }
+    
+    def liquidity_analysis(self):
+        """
+        Analyze portfolio liquidity and cash position.
+        
+        Returns:
+        dict: Liquidity metrics
+        """
+        total_portfolio = self.holdings['Market Value'].sum() + self.cash
+        
+        cash_pct = (self.cash / total_portfolio * 100) if total_portfolio > 0 else 0
+        
+        # Determine liquidity score (0-100)
+        # Higher cash = more liquid, but potentially underinvested
+        if cash_pct > 30:
+            liquidity_score = 85
+        elif cash_pct > 20:
+            liquidity_score = 80
+        elif cash_pct > 10:
+            liquidity_score = 75
+        elif cash_pct > 5:
+            liquidity_score = 70
+        else:
+            liquidity_score = 65
+        
+        return {
+            'Cash Balance': round(self.cash, 2),
+            'Cash Percentage': round(cash_pct, 2),
+            'Total Portfolio Value': round(total_portfolio, 2),
+            'Liquidity Score (0-100)': liquidity_score,
+            'Liquidity Assessment': 'Healthy' if cash_pct >= 5 else 'Low - Consider rebalancing'
+        }
+    
+    def transaction_analysis(self):
+        """
+        Analyze trading activity and turnover.
+        
+        Returns:
+        dict: Transaction metrics
+        """
+        if self.transactions.empty:
+            return {'Message': 'No transaction data available'}
+        
+        buys = self.transactions[self.transactions['Transaction Type'] == 'Bought']
+        sells = self.transactions[self.transactions['Transaction Type'] == 'Sold']
+        
+        total_bought = buys['Total Value'].sum() if len(buys) > 0 else 0
+        total_sold = sells['Total Value'].sum() if len(sells) > 0 else 0
+        
+        # Portfolio turnover (simplified)
+        total_portfolio = self.holdings['Market Value'].sum()
+        turnover_pct = ((total_bought + total_sold) / 2 / total_portfolio * 100) if total_portfolio > 0 else 0
+        
+        return {
+            'Total Buys': len(buys),
+            'Total Sells': len(sells),
+            'Total Amount Bought': round(total_bought, 2),
+            'Total Amount Sold': round(total_sold, 2),
+            'Portfolio Turnover (%)': round(turnover_pct, 2),
+            'Avg Transaction Size': round((total_bought + total_sold) / (len(buys) + len(sells)), 2) if (len(buys) + len(sells)) > 0 else 0
+        }
+    
+    def holdings_quality_analysis(self):
+        """
+        Analyze quality and characteristics of individual holdings.
+        
+        Returns:
+        dict: Holdings quality metrics
+        """
+        quality_metrics = {
+            'Highly Profitable (>50%)': len(self.holdings[self.holdings['Total Gain %'] > 50]),
+            'Profitable (0-50%)': len(self.holdings[(self.holdings['Total Gain %'] > 0) & (self.holdings['Total Gain %'] <= 50)]),
+            'Breakeven': len(self.holdings[self.holdings['Total Gain %'] == 0]),
+            'Small Loss (-10% to 0%)': len(self.holdings[(self.holdings['Total Gain %'] < 0) & (self.holdings['Total Gain %'] >= -10)]),
+            'Moderate Loss (-50% to -10%)': len(self.holdings[(self.holdings['Total Gain %'] < -10) & (self.holdings['Total Gain %'] >= -50)]),
+            'Major Loss (< -50%)': len(self.holdings[self.holdings['Total Gain %'] < -50])
+        }
+        
+        # Find best and worst performers
+        best_performer = self.holdings.loc[self.holdings['Total Gain %'].idxmax()]
+        worst_performer = self.holdings.loc[self.holdings['Total Gain %'].idxmin()]
+        
+        return {
+            'Holdings Quality Distribution': quality_metrics,
+            'Best Performer': {
+                'Symbol': best_performer['Symbol'],
+                'Gain %': round(best_performer['Total Gain %'], 2),
+                'Market Value': round(best_performer['Market Value'], 2)
+            },
+            'Worst Performer': {
+                'Symbol': worst_performer['Symbol'],
+                'Gain %': round(worst_performer['Total Gain %'], 2),
+                'Market Value': round(worst_performer['Market Value'], 2)
+            }
+        }
+    
+    def generate_full_report(self):
+        """
+        Generate comprehensive analytics report.
+        
+        Returns:
+        dict: Full analytics report
+        """
+        return {
+            'Concentration Analysis': self.concentration_analysis(),
+            'Sector Analysis': self.sector_analysis(),
+            'Performance Metrics': self.performance_metrics(),
+            'Risk Metrics': self.risk_metrics(),
+            'Liquidity Analysis': self.liquidity_analysis(),
+            'Holdings Quality': self.holdings_quality_analysis(),
+            'Transaction Analysis': self.transaction_analysis()
+        }
+
+
+def export_analytics_to_excel(consolidated_df, analytics_report, filename=None):
+    """
+    Export analytics report to Excel with formatting.
+    
+    Parameters:
+    consolidated_df: Consolidated holdings DataFrame
+    analytics_report: Full analytics report from generate_full_report()
+    filename: Name of Excel file
+    """
+    import xlsxwriter
+    
+    if filename is None:
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        filename = f'portfolio_analytics_{current_date}.xlsx'
+    
+    with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
+        workbook = writer.book
+        
+        # Format definitions
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#1F4E78',
+            'font_color': 'white',
+            'border': 1,
+            'valign': 'vcenter'
+        })
+        
+        section_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#D9E1F2',
+            'border': 1
+        })
+        
+        data_format = workbook.add_format({
+            'border': 1,
+            'valign': 'top'
+        })
+        
+        currency_format = workbook.add_format({
+            'num_format': '$#,##0.00',
+            'border': 1
+        })
+        
+        percent_format = workbook.add_format({
+            'num_format': '0.00%',
+            'border': 1
+        })
+        
+        # Create summary sheet
+        summary_sheet = workbook.add_worksheet('Analytics Summary')
+        row = 0
+        
+        for section_name, section_data in analytics_report.items():
+            # Section header
+            summary_sheet.write(row, 0, section_name, section_format)
+            summary_sheet.write(row, 1, '', section_format)
+            row += 1
+            
+            if isinstance(section_data, dict):
+                for key, value in section_data.items():
+                    if isinstance(value, (dict, list)):
+                        summary_sheet.write(row, 0, key, data_format)
+                        summary_sheet.write(row, 1, str(value), data_format)
+                    else:
+                        summary_sheet.write(row, 0, key, data_format)
+                        summary_sheet.write(row, 1, value, data_format)
+                    row += 1
+            
+            row += 1
+        
+        summary_sheet.set_column(0, 0, 30)
+        summary_sheet.set_column(1, 1, 40)
+        
+        # Create detailed holdings sheet with performance
+        holdings_sheet = workbook.add_worksheet('Holdings Detail')
+        
+        holdings_display = consolidated_df[consolidated_df['Symbol'] != 'CASH'].copy()
+        holdings_display.to_excel(writer, sheet_name='Holdings Detail', index=False, startrow=0)
+        
+        # Apply formatting
+        for col_num, value in enumerate(holdings_display.columns.values):
+            holdings_sheet.write(0, col_num, value, header_format)
+        
+        for i in range(len(holdings_display.columns)):
+            holdings_sheet.set_column(i, i, 15)
+    
+    print(f"Analytics exported to {filename}")
