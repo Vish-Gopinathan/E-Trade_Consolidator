@@ -298,13 +298,40 @@ EXTERNAL_CASH_TYPES = ['Electronic Funds Transfer', 'Check', 'Wire', 'ACH',
 # or internal inter-account move; Journal is almost always internal bookkeeping)
 AMBIGUOUS_TYPES = ['Transfer', 'Journal']
 
-# Keywords in the description that indicate an EXTERNAL transfer
-_EXTERNAL_DESCRIPTION_KEYWORDS = ['ach', 'electronic funds', 'wire', 'deposit', 'withdrawl',
-                                    'withdrawal', 'external', 'bank']
+# Keywords in the description that indicate an EXTERNAL transfer.
+# 'ach deposit' and 'ach withdrawal' are the exact labels E*TRADE uses for
+# bank transfers — list them first so they match before shorter substrings.
+_EXTERNAL_DESCRIPTION_KEYWORDS = ['ach deposit', 'ach withdrawal', 'ach', 'electronic funds',
+                                   'wire', 'external', 'bank transfer',
+                                   'deposit from bank', 'withdrawal to bank']
 
 # Keywords in the description that indicate an INTERNAL transfer (exclude from cash flows)
 _INTERNAL_DESCRIPTION_KEYWORDS = ['internal', 'journal', 'inter-account', 'transfer from acct',
                                    'transfer to acct', 'transfer between']
+
+def _date_chunks(start_date, end_date, chunk_days=89):
+    """
+    Split [start_date, end_date] into consecutive windows of at most chunk_days.
+
+    The E*TRADE API rejects list_transactions requests that span more than 90
+    days, so we break long ranges into 89-day windows (one day of margin) and
+    concatenate the results.
+
+    Args:
+        start_date: datetime.date — start of full range (inclusive).
+        end_date:   datetime.date — end of full range (inclusive).
+        chunk_days: Maximum window size in days (default 89).
+
+    Yields:
+        (chunk_start, chunk_end) pairs of datetime.date objects.
+    """
+    current = start_date
+    delta = datetime.timedelta(days=chunk_days)
+    while current <= end_date:
+        chunk_end = min(current + delta, end_date)
+        yield current, chunk_end
+        current = chunk_end + datetime.timedelta(days=1)
+
 
 def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_date):
     """
@@ -313,6 +340,11 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
     Includes both trade transactions (Bought/Sold) and cash flow transactions
     (deposits, withdrawals, transfers). All rows share the same schema; columns
     that don't apply to a given transaction type are left as None.
+
+    The E*TRADE API limits each list_transactions call to a 90-day window.
+    This function automatically splits longer date ranges into 89-day chunks
+    and merges the results, so callers can pass any date range without
+    worrying about the API limit.
 
     Columns returned:
         Date             - transaction date
@@ -337,8 +369,18 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
     if not isinstance(end_date, datetime.date):
         raise TypeError("end_date must be a datetime.date object")
 
-    transaction_list_response = accounts_obj.list_transactions(account_id_key, start_date, end_date)
-    transactions = transaction_list_response.get('TransactionListResponse', {}).get('Transaction', [])
+    # Collect transactions across all 89-day windows
+    all_transactions = []
+    for chunk_start, chunk_end in _date_chunks(start_date, end_date):
+        try:
+            resp = accounts_obj.list_transactions(account_id_key, chunk_start, chunk_end)
+            chunk_txns = resp.get('TransactionListResponse', {}).get('Transaction', [])
+            if chunk_txns:
+                all_transactions.extend(chunk_txns)
+        except Exception as e:
+            print(f"   Warning: failed to fetch transactions {chunk_start}–{chunk_end}: {e}")
+
+    transactions = all_transactions
 
     if not transactions:
         return pd.DataFrame()
@@ -387,6 +429,10 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
                 dollar_amount = None
 
             category = _classify_non_trade(t_type, description, dollar_amount)
+
+            # Debug: print non-trade transactions so classification can be verified
+            print(f"   [TXN] type='{t_type}' | desc='{description}' | "
+                  f"amount={dollar_amount} | → {category}")
 
             # Skip pure internal bookkeeping entries — they are not meaningful cash flows
             if category == 'Internal':
@@ -470,7 +516,10 @@ def _classify_non_trade(t_type, description, amount):
         return _direction_by_amount(amount)
 
     # --- 4. Catch-all: description keyword match ---
-    if any(kw in combined for kw in _EXTERNAL_DESCRIPTION_KEYWORDS):
+    # Also match bare 'deposit' / 'withdrawal' words anywhere in the description
+    # (e.g. E*TRADE description "ACH DEPOSIT" on a Transfer-type transaction).
+    _catch_all_keywords = _EXTERNAL_DESCRIPTION_KEYWORDS + ['deposit', 'withdrawal', 'withdrawl']
+    if any(kw in combined for kw in _catch_all_keywords):
         return _direction_by_amount(amount)
 
     return 'Other'
