@@ -89,6 +89,20 @@ def main():
             print(f"   Found {len(cash_flow_data)} cash flow(s): "
                   f"${deposits:,.2f} deposited, ${abs(withdrawals):,.2f} withdrawn")
 
+        # Extract income rows (dividends, interest) — separate from external cash flows
+        if not transaction_data.empty and 'Category' in transaction_data.columns:
+            income_rows = transaction_data[transaction_data['Category'] == 'Income'].copy()
+            if not income_rows.empty:
+                income_data = income_rows[['Date', 'Security Name', 'Total Value', 'Transaction Type']].rename(
+                    columns={'Security Name': 'Description'}
+                )
+                total_income = pd.to_numeric(income_data['Total Value'], errors='coerce').sum()
+                print(f"   Found {len(income_data)} income transaction(s): ${total_income:,.2f} total")
+            else:
+                income_data = None
+        else:
+            income_data = None
+
         # Build output paths
         output_dir = args.output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -99,7 +113,8 @@ def main():
         # Export consolidated portfolio
         print("[3/4] Exporting consolidated portfolio...")
         export_to_excel(consolidated_portfolio, transaction_data,
-                        cash_flows_df=cash_flow_data, filename=holdings_file)
+                        cash_flows_df=cash_flow_data, income_df=income_data,
+                        filename=holdings_file)
 
         print("\n" + "=" * 60)
         print("PORTFOLIO SUMMARY")
