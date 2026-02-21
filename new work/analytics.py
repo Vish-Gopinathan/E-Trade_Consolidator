@@ -56,7 +56,7 @@ class PortfolioAnalytics:
         self.transactions = transactions_df if transactions_df is not None else pd.DataFrame()
         self.risk_free_rate = risk_free_rate
 
-        # Cash flows: use explicit argument if provided, otherwise derive from transactions
+        # Cash flows: external deposits and withdrawals only (not Income or Internal)
         if cash_flows_df is not None:
             self.cash_flows = cash_flows_df
         elif not self.transactions.empty and 'Category' in self.transactions.columns:
@@ -66,6 +66,15 @@ class PortfolioAnalytics:
             ) if not cf.empty else pd.DataFrame()
         else:
             self.cash_flows = pd.DataFrame()
+
+        # Income rows: dividends and interest (separate from external cash flows)
+        if not self.transactions.empty and 'Category' in self.transactions.columns:
+            inc = self.transactions[self.transactions['Category'] == 'Income'].copy()
+            self.income = inc[['Date', 'Security Name', 'Total Value', 'Transaction Type']].rename(
+                columns={'Security Name': 'Description'}
+            ) if not inc.empty else pd.DataFrame()
+        else:
+            self.income = pd.DataFrame()
         
     def concentration_analysis(self):
         """
@@ -265,7 +274,44 @@ class PortfolioAnalytics:
             result['Most Recent Withdrawal'] = str(withdrawals['Date'].max().date())
 
         return result
-    
+
+    def income_summary(self):
+        """
+        Summarise dividend and interest income received in the period.
+
+        This is separate from cash flow (deposits/withdrawals) — income is money
+        generated inside the account, not transferred in from outside.
+
+        Returns:
+        dict: Income metrics broken down by type (Dividend, Interest, etc.),
+              or a message if no income data is available.
+        """
+        if self.income.empty:
+            return {'Message': 'No income data available'}
+
+        inc = self.income.copy()
+        inc['Total Value'] = pd.to_numeric(inc['Total Value'], errors='coerce').fillna(0)
+
+        total_income = inc['Total Value'].sum()
+
+        result = {
+            'Total Income': round(total_income, 2),
+            'Number of Income Transactions': len(inc),
+        }
+
+        # Break down by transaction type (Dividend vs Interest vs other)
+        if 'Transaction Type' in inc.columns:
+            for t_type, group in inc.groupby('Transaction Type'):
+                type_total = group['Total Value'].sum()
+                result[f'{t_type} Income'] = round(type_total, 2)
+                result[f'{t_type} Count'] = len(group)
+
+        if not inc.empty:
+            result['Most Recent Income'] = str(inc['Date'].max().date()) if hasattr(inc['Date'].max(), 'date') else str(inc['Date'].max())
+            result['Largest Single Income'] = round(inc['Total Value'].max(), 2)
+
+        return result
+
     def risk_metrics(self):
         """
         Calculate portfolio risk metrics.
@@ -412,7 +458,7 @@ class PortfolioAnalytics:
     def generate_full_report(self):
         """
         Generate comprehensive analytics report.
-        
+
         Returns:
         dict: Full analytics report
         """
@@ -421,6 +467,7 @@ class PortfolioAnalytics:
             'Sector Analysis': self.sector_analysis(),
             'Performance Metrics': self.performance_metrics(),
             'Cash Flow Summary': self.cash_flow_summary(),
+            'Income Summary': self.income_summary(),
             'Risk Metrics': self.risk_metrics(),
             'Liquidity Analysis': self.liquidity_analysis(),
             'Holdings Quality': self.holdings_quality_analysis(),

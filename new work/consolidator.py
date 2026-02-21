@@ -274,9 +274,37 @@ def add_totals_row(consolidated_df):
     return consolidated_df
 
 # Transaction type constants
+#
+# Category definitions:
+#   Trade    - security buy/sell (Bought, Sold)
+#   Deposit  - external money entering the brokerage (ACH in, wire in, IRA contribution)
+#   Withdrawal - external money leaving the brokerage (ACH out, wire out, IRA distribution)
+#   Income   - dividends, interest, fees — money generated within the account, NOT an
+#              external transfer and should NOT affect deposit-adjusted return calculations
+#   Internal - inter-account transfers within E*TRADE (Journal entries, internal moves)
+#              these are excluded from all cash flow reporting
+#   Other    - anything unrecognised
+
 TRADE_TYPES = ['Bought', 'Sold']
-CASH_FLOW_TYPES = ['Electronic Funds Transfer', 'Check', 'Transfer', 'Journal', 'Dividend',
-                   'Interest', 'Contribution', 'Distribution', 'Wire', 'ACH']
+
+# Types that are always income, never external cash flows
+INCOME_TYPES = ['Dividend', 'Interest', 'Fee', 'Refund']
+
+# Types that are unambiguously external cash movements (sign of amount determines direction)
+EXTERNAL_CASH_TYPES = ['Electronic Funds Transfer', 'Check', 'Wire', 'ACH',
+                       'Contribution', 'Distribution']
+
+# Types that require description-based disambiguation (Transfer can be external ACH
+# or internal inter-account move; Journal is almost always internal bookkeeping)
+AMBIGUOUS_TYPES = ['Transfer', 'Journal']
+
+# Keywords in the description that indicate an EXTERNAL transfer
+_EXTERNAL_DESCRIPTION_KEYWORDS = ['ach', 'electronic funds', 'wire', 'deposit', 'withdrawl',
+                                    'withdrawal', 'external', 'bank']
+
+# Keywords in the description that indicate an INTERNAL transfer (exclude from cash flows)
+_INTERNAL_DESCRIPTION_KEYWORDS = ['internal', 'journal', 'inter-account', 'transfer from acct',
+                                   'transfer to acct', 'transfer between']
 
 def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_date):
     """
@@ -293,7 +321,7 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
         Price            - price per share (trades only)
         Total Value      - total dollar amount (positive = money in, negative = money out)
         Transaction Type - original type string from API
-        Category         - 'Trade', 'Deposit', 'Withdrawal', or 'Other'
+        Category         - 'Trade', 'Deposit', 'Withdrawal', 'Income', 'Internal', or 'Other'
 
     Args:
         accounts_obj: pyetrade.ETradeAccounts instance.
@@ -351,15 +379,18 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
                 'Category': 'Trade'
             })
 
-        elif t_type in CASH_FLOW_TYPES or _is_cash_flow(t_type, description):
-            # Cash flows: no quantity/price, use the top-level amount directly.
-            # Deposits are positive; withdrawals/distributions are negative.
+        else:
+            # Everything that isn't a trade: income, external cash flows, internal transfers
             try:
                 dollar_amount = float(amount) if amount is not None else None
             except (ValueError, TypeError):
                 dollar_amount = None
 
-            category = _classify_cash_flow(t_type, dollar_amount)
+            category = _classify_non_trade(t_type, description, dollar_amount)
+
+            # Skip pure internal bookkeeping entries — they are not meaningful cash flows
+            if category == 'Internal':
+                continue
 
             transaction_data.append({
                 'Date': t_date,
@@ -379,32 +410,77 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
     return df
 
 
-def _is_cash_flow(t_type, description):
+def _classify_non_trade(t_type, description, amount):
     """
-    Catch-all for cash flow types not in the explicit CASH_FLOW_TYPES list.
-    E*TRADE occasionally uses non-standard type strings.
-    """
-    cash_keywords = ['deposit', 'withdrawal', 'transfer', 'contribution',
-                     'distribution', 'wire', 'ach', 'journal']
-    combined = (t_type + ' ' + description).lower()
-    return any(kw in combined for kw in cash_keywords)
+    Classify a non-trade transaction into one of:
+      'Deposit'    - external money entering the brokerage
+      'Withdrawal' - external money leaving the brokerage
+      'Income'     - dividends, interest, fees (internal to the account)
+      'Internal'   - inter-account transfers within E*TRADE (excluded from reporting)
+      'Other'      - unrecognised type
 
-
-def _classify_cash_flow(t_type, amount):
-    """
-    Return 'Deposit', 'Withdrawal', or 'Other' based on type and sign of amount.
+    Classification priority:
+      1. Income types are always Income regardless of description.
+      2. Ambiguous types (Transfer, Journal) are resolved by description keywords:
+         - External keywords → Deposit/Withdrawal by amount sign
+         - Internal keywords → Internal (will be excluded)
+         - Journal with no external signal → Internal
+      3. Unambiguous external types (Electronic Funds Transfer, Wire, ACH, Check,
+         Contribution, Distribution) are classified by type name and amount sign.
+      4. Anything else with deposit/withdrawal keywords in the description is
+         classified by amount sign.
+      5. Fallthrough → Other.
     """
     t_lower = t_type.lower()
-    deposit_types = ['electronic funds transfer', 'contribution', 'ach', 'wire', 'check']
-    withdrawal_types = ['distribution']
+    desc_lower = description.lower()
+    combined = t_lower + ' ' + desc_lower
 
-    if any(d in t_lower for d in deposit_types):
-        return 'Deposit' if (amount is None or amount >= 0) else 'Withdrawal'
-    if any(w in t_lower for w in withdrawal_types):
-        return 'Withdrawal'
-    if amount is not None:
-        return 'Deposit' if amount >= 0 else 'Withdrawal'
+    # --- 1. Income types ---
+    if t_type in INCOME_TYPES:
+        return 'Income'
+
+    # --- 2. Ambiguous types: resolve by description ---
+    if t_type in AMBIGUOUS_TYPES:
+        has_external_signal = any(kw in combined for kw in _EXTERNAL_DESCRIPTION_KEYWORDS)
+        has_internal_signal = any(kw in combined for kw in _INTERNAL_DESCRIPTION_KEYWORDS)
+
+        # Journal with no external signal → internal bookkeeping
+        if t_lower == 'journal' and not has_external_signal:
+            return 'Internal'
+
+        if has_internal_signal and not has_external_signal:
+            return 'Internal'
+
+        if has_external_signal:
+            return _direction_by_amount(amount)
+
+        # Transfer/Journal with no clear signal: use amount sign as fallback,
+        # but flag as 'Other' so it doesn't silently inflate deposit totals
+        return 'Other'
+
+    # --- 3. Unambiguous external types ---
+    if t_type in EXTERNAL_CASH_TYPES:
+        # IRA distributions are always outflows
+        if t_lower == 'distribution':
+            return 'Withdrawal'
+        # IRA contributions are always inflows
+        if t_lower == 'contribution':
+            return 'Deposit'
+        # For all others, amount sign is definitive
+        return _direction_by_amount(amount)
+
+    # --- 4. Catch-all: description keyword match ---
+    if any(kw in combined for kw in _EXTERNAL_DESCRIPTION_KEYWORDS):
+        return _direction_by_amount(amount)
+
     return 'Other'
+
+
+def _direction_by_amount(amount):
+    """Return 'Deposit' for positive amounts, 'Withdrawal' for negative."""
+    if amount is None:
+        return 'Other'
+    return 'Deposit' if amount >= 0 else 'Withdrawal'
 
 def get_all_consolidated_transactions(accounts_obj, active_accounts, start_date, end_date):
     """
@@ -452,7 +528,9 @@ def get_cash_flows(transaction_df):
         DataFrame with columns: Date, Description, Total Value, Category
         Positive Total Value = money coming into the portfolio (deposit).
         Negative Total Value = money leaving the portfolio (withdrawal).
-        Returns empty DataFrame if no cash flow rows exist.
+        Only includes Category == 'Deposit' or 'Withdrawal'. Income (dividends,
+        interest), Internal transfers, Trades, and Other are excluded.
+        Returns empty DataFrame if no external cash flow rows exist.
     """
     if transaction_df.empty or 'Category' not in transaction_df.columns:
         return pd.DataFrame(columns=['Date', 'Description', 'Total Value', 'Category'])
@@ -468,7 +546,7 @@ def get_cash_flows(transaction_df):
     return result
 
 def export_to_excel(consolidated_df, transactions_df=None, cash_flows_df=None,
-                    filename=None, summary_spacing=3):
+                    income_df=None, filename=None, summary_spacing=3):
     """
     Export consolidated holdings DataFrame to an Excel file with formatting.
 
@@ -476,6 +554,7 @@ def export_to_excel(consolidated_df, transactions_df=None, cash_flows_df=None,
     consolidated_df (pandas.DataFrame): Consolidated holdings DataFrame
     transactions_df (pandas.DataFrame, optional): Full transactions DataFrame (trades + cash flows)
     cash_flows_df (pandas.DataFrame, optional): Deposit/withdrawal rows for the Cash Flows sheet
+    income_df (pandas.DataFrame, optional): Income rows (dividends, interest) for the Income sheet
     filename (str, optional): Name of the Excel file to save
     summary_spacing (int, optional): Number of blank rows before the summary section
     """
@@ -710,6 +789,85 @@ def export_to_excel(consolidated_df, transactions_df=None, cash_flows_df=None,
             for i, col in enumerate(cash_flows_df.columns):
                 column_len = max(cash_flows_df[col].astype(str).map(len).max(), len(col))
                 cf_worksheet.set_column(i, i, column_len + 2)
+
+        # Add Income sheet if income data is provided
+        if income_df is not None and not income_df.empty:
+            income_df.to_excel(writer, sheet_name='Income', index=False)
+
+            inc_worksheet = writer.sheets['Income']
+
+            # Header formatting
+            for col_num, value in enumerate(income_df.columns.values):
+                inc_worksheet.write(0, col_num, value, header_format)
+
+            # Date formatting
+            date_format = workbook.add_format({'num_format': 'yyyy-mm-dd'})
+            inc_worksheet.set_column('A:A', 14, date_format)   # Date
+
+            # Colour-code rows by income type: gold for dividends, blue for interest, grey for other
+            dividend_format = workbook.add_format({
+                'bg_color': '#FFF2CC', 'border': 1, 'num_format': '$#,##0.00', 'align': 'right'
+            })
+            interest_format = workbook.add_format({
+                'bg_color': '#DDEEFF', 'border': 1, 'num_format': '$#,##0.00', 'align': 'right'
+            })
+            other_income_format = workbook.add_format({
+                'bg_color': '#F2F2F2', 'border': 1, 'num_format': '$#,##0.00', 'align': 'right'
+            })
+
+            value_col_idx = list(income_df.columns).index('Total Value') if 'Total Value' in income_df.columns else None
+            type_col_idx = list(income_df.columns).index('Transaction Type') if 'Transaction Type' in income_df.columns else None
+
+            if value_col_idx is not None:
+                for row_idx, (_, row) in enumerate(income_df.iterrows(), start=1):
+                    t_type = row.get('Transaction Type', '') if type_col_idx is not None else ''
+                    if t_type == 'Dividend':
+                        fmt = dividend_format
+                    elif t_type == 'Interest':
+                        fmt = interest_format
+                    else:
+                        fmt = other_income_format
+
+                    val = row.get('Total Value')
+                    if val is not None:
+                        try:
+                            inc_worksheet.write(row_idx, value_col_idx, float(val), fmt)
+                        except (ValueError, TypeError):
+                            inc_worksheet.write(row_idx, value_col_idx, str(val), fmt)
+
+            # Summary rows below the income data
+            inc_summary_start = len(income_df) + 2
+            inc_worksheet.write(inc_summary_start, 0, "SUMMARY", header_format)
+            inc_worksheet.write(inc_summary_start, 1, '', header_format)
+
+            inc_total_row_format = workbook.add_format({
+                'bold': True, 'bg_color': '#E6F2FF', 'border': 1
+            })
+            inc_total_currency_format = workbook.add_format({
+                'bold': True, 'bg_color': '#E6F2FF', 'num_format': '$#,##0.00',
+                'align': 'right', 'border': 1
+            })
+
+            inc_amounts = pd.to_numeric(income_df['Total Value'], errors='coerce') if 'Total Value' in income_df.columns else pd.Series(dtype=float)
+            total_income = inc_amounts.sum()
+
+            r = inc_summary_start + 1
+            inc_worksheet.write(r, 0, "Total Income", inc_total_row_format)
+            inc_worksheet.write(r, 1, total_income, inc_total_currency_format)
+            r += 1
+
+            # Per-type subtotals
+            if 'Transaction Type' in income_df.columns and 'Total Value' in income_df.columns:
+                for t_type, group in income_df.groupby('Transaction Type'):
+                    type_total = pd.to_numeric(group['Total Value'], errors='coerce').sum()
+                    inc_worksheet.write(r, 0, f"  {t_type} Total", inc_total_row_format)
+                    inc_worksheet.write(r, 1, type_total, inc_total_currency_format)
+                    r += 1
+
+            # Auto-adjust column widths
+            for i, col in enumerate(income_df.columns):
+                column_len = max(income_df[col].astype(str).map(len).max(), len(col))
+                inc_worksheet.set_column(i, i, column_len + 2)
 
     print(f"Portfolio exported successfully to {filename}")
 
