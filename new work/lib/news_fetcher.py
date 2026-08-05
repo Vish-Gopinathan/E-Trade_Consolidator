@@ -1,274 +1,13 @@
-from datetime import datetime, date
-import time
-import pandas as pd
-import requests
+"""
+Market data helpers used by other pages.
+
+Earnings data is now handled by lib/earnings_store.py.
+"""
+
+from datetime import datetime
 import streamlit as st
 import yfinance as yf
-
-_EQUITY_TYPES = {'equity', 'stock', 'reit'}
-_FMP_STABLE = 'https://financialmodelingprep.com/stable'
-
-
-# ── Quote-type / ETF detection ────────────────────────────────────────────────
-
-def _quote_type(ticker) -> str:
-    try:
-        qt = getattr(ticker.fast_info, 'quote_type', None)
-        if qt:
-            return qt.lower()
-    except Exception:
-        pass
-    try:
-        return ticker.info.get('quoteType', 'equity').lower()
-    except Exception:
-        return 'equity'
-
-
-# ── Price reaction ────────────────────────────────────────────────────────────
-
-def _price_reaction(ticker, earnings_date: date):
-    """Return % change from close before earnings to close the next trading day."""
-    try:
-        start = pd.Timestamp(earnings_date) - pd.Timedelta(days=7)
-        end = pd.Timestamp(earnings_date) + pd.Timedelta(days=7)
-        hist = ticker.history(start=start, end=end)
-        if hist.empty:
-            return None
-        if hist.index.tz is not None:
-            hist.index = hist.index.tz_localize(None)
-        ts = pd.Timestamp(earnings_date)
-        before = hist[hist.index <= ts]
-        after = hist[hist.index > ts]
-        if before.empty or after.empty:
-            return None
-        p0 = float(before['Close'].iloc[-1])
-        p1 = float(after['Close'].iloc[0])
-        return round((p1 - p0) / p0 * 100, 2) if p0 else None
-    except Exception:
-        return None
-
-
-# ── FMP path ──────────────────────────────────────────────────────────────────
-
-def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
-    out = {'is_equity': True, 'name': symbol, 'upcoming': None, 'recent': [], '_fmp_error': None}
-    qt = _quote_type(ticker)
-    out['is_equity'] = qt in _EQUITY_TYPES
-    if not out['is_equity']:
-        return out
-
-    api_key = api_key.strip()
-    today = date.today()
-
-    # ── Historical earnings (stable/earnings endpoint) ────────────────────────
-    try:
-        resp = requests.get(
-            f'{_FMP_STABLE}/earnings',
-            params={'symbol': symbol, 'limit': 8, 'apikey': api_key},
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            rows = resp.json()
-            if not isinstance(rows, list):
-                out['_fmp_error'] = str(rows)
-                rows = []
-        else:
-            out['_fmp_error'] = f'HTTP {resp.status_code}: {resp.text[:200]}'
-            rows = []
-    except Exception as exc:
-        out['_fmp_error'] = str(exc)
-        rows = []
-
-    for row in rows:
-        try:
-            dt = date.fromisoformat(row['date'])
-        except Exception:
-            continue
-        if dt >= today or len(out['recent']) >= 4:
-            continue
-        eps_act = row.get('eps')
-        eps_est = row.get('epsEstimated')
-        rev_act = row.get('revenue')
-        rev_est = row.get('revenueEstimated')
-        if eps_act is None:
-            continue
-        surprise = None
-        if eps_est and eps_est != 0:
-            surprise = round((eps_act - eps_est) / abs(eps_est) * 100, 2)
-        price_chg = _price_reaction(ticker, dt) if len(out['recent']) == 0 else None
-        out['recent'].append({
-            'date': dt.isoformat(),
-            'eps_actual': float(eps_act),
-            'eps_estimate': float(eps_est) if eps_est is not None else None,
-            'surprise_pct': surprise,
-            'revenue_actual': float(rev_act) if rev_act else None,
-            'revenue_estimate': float(rev_est) if rev_est else None,
-            'price_chg_pct': price_chg,
-        })
-
-    # ── Upcoming earnings (stable/earnings-calendar endpoint) ─────────────────
-    try:
-        to_date = (today + __import__('datetime').timedelta(days=90)).isoformat()
-        resp = requests.get(
-            f'{_FMP_STABLE}/earnings-calendar',
-            params={'from': today.isoformat(), 'to': to_date, 'apikey': api_key},
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            cal_rows = resp.json()
-            if isinstance(cal_rows, list):
-                future_dates = []
-                for row in cal_rows:
-                    if row.get('symbol') != symbol:
-                        continue
-                    try:
-                        dt = date.fromisoformat(row['date'])
-                    except Exception:
-                        continue
-                    if dt >= today:
-                        future_dates.append((dt, row))
-                if future_dates:
-                    future_dates.sort(key=lambda x: x[0])
-                    dt, row = future_dates[0]
-                    eps_est = row.get('epsEstimated')
-                    rev_est = row.get('revenueEstimated')
-                    out['upcoming'] = {
-                        'date': dt.isoformat(),
-                        'eps_estimate': float(eps_est) if eps_est is not None else None,
-                        'revenue_estimate': float(rev_est) if rev_est is not None else None,
-                        'time': row.get('time', ''),
-                    }
-    except Exception:
-        pass
-
-    # Fall back to yfinance for upcoming if FMP calendar didn't have this symbol
-    if out['upcoming'] is None:
-        yf_data = _yf_fetch_one(symbol, ticker)
-        out['upcoming'] = yf_data.get('upcoming')
-
-    return out
-
-
-# ── yfinance path ─────────────────────────────────────────────────────────────
-
-def _yf_calendar_upcoming(ticker):
-    """Fallback: try ticker.calendar for an upcoming earnings date."""
-    try:
-        cal = ticker.calendar
-        if cal is None or (hasattr(cal, 'empty') and cal.empty):
-            return None
-        today = date.today()
-        for key in ('Earnings Date', 'earnings_date'):
-            if hasattr(cal, 'index') and key in cal.index:
-                val = cal.loc[key]
-                raw = val.iloc[0] if hasattr(val, 'iloc') else val
-                if pd.notna(raw):
-                    try:
-                        dt = pd.Timestamp(raw).date()
-                        if dt >= today:
-                            return dt
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return None
-
-
-def _yf_fetch_one(symbol: str, ticker) -> dict:
-    out = {'is_equity': True, 'name': symbol, 'upcoming': None, 'recent': []}
-    qt = _quote_type(ticker)
-    out['is_equity'] = qt in _EQUITY_TYPES
-    if not out['is_equity']:
-        return out
-
-    dates_df = None
-    try:
-        dates_df = ticker.get_earnings_dates(limit=16)
-    except Exception:
-        pass
-
-    if dates_df is not None and not dates_df.empty:
-        today = date.today()
-
-        # Iterate in descending order (nearest future last, so overwriting gives nearest upcoming)
-        for dt_idx, row in dates_df.iterrows():
-            try:
-                # .date() works safely on both tz-aware and tz-naive Timestamps
-                dt = dt_idx.date()
-            except Exception:
-                continue
-
-            eps_act = row.get('Reported EPS')
-            eps_est = row.get('EPS Estimate')
-            surprise = row.get('Surprise(%)')
-
-            if dt >= today:
-                # Upcoming or announcing today — keep overwriting so we end up with nearest date
-                out['upcoming'] = {
-                    'date': dt.isoformat(),
-                    'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
-                    'revenue_estimate': None,
-                    'time': '',
-                }
-            else:
-                # Past earnings
-                if len(out['recent']) >= 4:
-                    continue
-                if pd.isna(eps_act) and pd.isna(eps_est):
-                    continue
-                price_chg = _price_reaction(ticker, dt) if len(out['recent']) == 0 else None
-                out['recent'].append({
-                    'date': dt.isoformat(),
-                    'eps_actual': float(eps_act) if pd.notna(eps_act) else None,
-                    'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
-                    'surprise_pct': float(surprise) if pd.notna(surprise) else None,
-                    'revenue_actual': None,
-                    'revenue_estimate': None,
-                    'price_chg_pct': price_chg,
-                })
-
-    if out['upcoming'] is None:
-        fallback = _yf_calendar_upcoming(ticker)
-        if fallback:
-            out['upcoming'] = {
-                'date': fallback.isoformat(),
-                'eps_estimate': None,
-                'revenue_estimate': None,
-                'time': '',
-            }
-
-    return out
-
-
-def _fetch_one(symbol: str, fmp_key: str) -> dict:
-    ticker = yf.Ticker(symbol)
-    if fmp_key:
-        return _fmp_fetch_one(symbol, fmp_key, ticker)
-    return _yf_fetch_one(symbol, ticker)
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=14400)
-def get_full_earnings_data(symbols: tuple, fmp_key: str = '') -> dict:
-    """
-    Return {symbol: data} for all equity symbols. Fetches sequentially to
-    avoid yfinance rate limits. Cached 4 hours.
-
-    Callers should pass a Streamlit progress object via st.progress() before
-    calling; this function does NOT write to Streamlit directly.
-    """
-    results = {}
-    for symbol in symbols:
-        try:
-            results[symbol] = _fetch_one(symbol, fmp_key)
-        except Exception:
-            results[symbol] = {
-                'is_equity': True, 'name': symbol,
-                'upcoming': None, 'recent': [],
-            }
-        time.sleep(0.3)  # avoid yfinance rate limits on cloud deployments
-    return results
+import pandas as pd
 
 
 @st.cache_data(ttl=300)
@@ -297,9 +36,8 @@ def get_current_prices(symbols: tuple) -> dict:
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_split_history(symbols: tuple) -> dict:
     """
-    Return {symbol: pd.Series} where the Series has a DatetimeIndex of split
-    dates and float values (ratio = new shares per old share, e.g. 10 for a 10:1).
-    Cached 24 hours — splits are rare and never retroactively change.
+    Return {symbol: pd.Series} with split dates and ratios.
+    Cached 24 hours.
     """
     result = {}
     for sym in symbols:
@@ -310,39 +48,19 @@ def get_split_history(symbols: tuple) -> dict:
     return result
 
 
-def cumulative_split_factor(splits_series, since_date: date) -> float:
+def cumulative_split_factor(splits_series, since_date) -> float:
     """
-    Product of all split ratios for splits that occurred AFTER since_date.
-    Returns 1.0 when there are no splits (no adjustment needed).
+    Product of all split ratios that occurred AFTER since_date.
+    Returns 1.0 when there are no splits.
     """
     if splits_series is None or (hasattr(splits_series, 'empty') and splits_series.empty):
         return 1.0
     try:
         since_ts = pd.Timestamp(since_date)
         idx = splits_series.index
-        # Strip timezone for safe comparison (same pattern as _yf_fetch_one)
         if idx.tz is not None:
             idx = idx.tz_localize(None)
         after = splits_series[idx > since_ts]
         return float(after.prod()) if not after.empty else 1.0
     except Exception:
         return 1.0
-
-
-@st.cache_data(ttl=3600)
-def get_news(symbol: str, limit: int = 10) -> list:
-    """Return up to `limit` recent news articles for `symbol`. Cached 1 hour."""
-    try:
-        raw = yf.Ticker(symbol).news or []
-        articles = []
-        for item in raw[:limit]:
-            ts = item.get('providerPublishTime') or item.get('publishTime')
-            articles.append({
-                'title': item.get('title', ''),
-                'link': item.get('link', ''),
-                'publisher': item.get('publisher', ''),
-                'published_at': datetime.fromtimestamp(ts) if ts else None,
-            })
-        return articles
-    except Exception:
-        return []
