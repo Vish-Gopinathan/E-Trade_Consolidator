@@ -1,3 +1,4 @@
+import hmac
 import os
 import sys
 import datetime
@@ -13,7 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from lib.etrade_session import get_oauth_url, complete_oauth
 from lib.data_cache import save_portfolio, load_portfolio
-from lib.common import render_sidebar_status
+from lib.common import render_sidebar_status, get_secret
+
+_MAX_LOGIN_ATTEMPTS = 5
+_LOCKOUT_MINUTES = 15
+_SESSION_TIMEOUT_HOURS = 8
 
 st.set_page_config(
     page_title='Portfolio Dashboard',
@@ -160,20 +165,51 @@ def _refresh_data(start_date, end_date):
     st.rerun()
 
 
+# ── Session timeout check ─────────────────────────────────────────────────────
+
+if st.session_state.get('authenticated'):
+    last_activity = st.session_state.get('last_activity')
+    if last_activity:
+        idle_seconds = (datetime.datetime.now() - last_activity).total_seconds()
+        if idle_seconds > _SESSION_TIMEOUT_HOURS * 3600:
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.warning('Session expired after inactivity. Please log in again.')
+    st.session_state.last_activity = datetime.datetime.now()
+
 # ── Password gate ────────────────────────────────────────────────────────────
 
-APP_PASSWORD = os.getenv('APP_PASSWORD', '')
+APP_PASSWORD = get_secret('APP_PASSWORD')
 
 if not st.session_state.get('authenticated'):
     st.title('Portfolio Dashboard')
+
+    # Brute-force lockout
+    locked_until = st.session_state.get('locked_until')
+    if locked_until and datetime.datetime.now() < locked_until:
+        remaining_min = int((locked_until - datetime.datetime.now()).total_seconds() // 60) + 1
+        st.error(f'Too many failed attempts. Try again in {remaining_min} minute(s).')
+        st.stop()
+
     st.markdown('Please enter the app password to continue.')
     pwd = st.text_input('Password', type='password', key='login_pwd')
     if st.button('Login') or pwd:
-        if pwd == APP_PASSWORD and APP_PASSWORD:
+        if APP_PASSWORD and hmac.compare_digest(pwd.encode(), APP_PASSWORD.encode()):
             st.session_state.authenticated = True
+            st.session_state.login_attempts = 0
+            st.session_state.last_activity = datetime.datetime.now()
             st.rerun()
         elif pwd:
-            st.error('Incorrect password.')
+            attempts = st.session_state.get('login_attempts', 0) + 1
+            st.session_state.login_attempts = attempts
+            if attempts >= _MAX_LOGIN_ATTEMPTS:
+                st.session_state.locked_until = (
+                    datetime.datetime.now() + datetime.timedelta(minutes=_LOCKOUT_MINUTES)
+                )
+                st.error(f'Too many failed attempts. Locked for {_LOCKOUT_MINUTES} minutes.')
+            else:
+                remaining = _MAX_LOGIN_ATTEMPTS - attempts
+                st.error(f'Incorrect password. {remaining} attempt(s) remaining before lockout.')
     st.stop()
 
 # ── Load cache on first run ──────────────────────────────────────────────────

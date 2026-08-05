@@ -1,4 +1,14 @@
+import os
 import streamlit as st
+
+
+def get_secret(key: str, default: str = '') -> str:
+    """Read from st.secrets first (Streamlit Cloud), fall back to env var (local dev)."""
+    try:
+        return st.secrets[key]
+    except (KeyError, AttributeError, FileNotFoundError):
+        return os.getenv(key, default)
+
 
 STATUS_COLORS = {
     'On Track': 'green',

@@ -6,14 +6,23 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / '.env')
 
 
+def _get_secret(key: str) -> str:
+    """Try st.secrets first (Streamlit Cloud), fall back to env var (local dev)."""
+    try:
+        import streamlit as st
+        return st.secrets[key]
+    except (KeyError, AttributeError, FileNotFoundError):
+        return os.getenv(key, '')
+
+
 def get_oauth_url():
     """
     Step 1 of the Streamlit OAuth flow.
     Returns (authorization_url, oauth_object, consumer_key, consumer_secret).
     Store all four in st.session_state — complete_oauth() needs the oauth object.
     """
-    consumer_key = os.getenv('CONSUMER_KEY')
-    consumer_secret = os.getenv('CONSUMER_SECRET')
+    consumer_key = _get_secret('CONSUMER_KEY')
+    consumer_secret = _get_secret('CONSUMER_SECRET')
     oauth = pyetrade.ETradeOAuth(consumer_key, consumer_secret)
     url = oauth.get_request_token()
     return url, oauth, consumer_key, consumer_secret

@@ -524,3 +524,50 @@ The overview table shows all holdings with colour-coded status badges so you can
 | `data/thesis.json` | Thesis tracker data |
 
 Both are excluded from git via `.gitignore`.
+
+---
+
+### Deploying to Streamlit Community Cloud
+
+Streamlit Community Cloud cannot read your local `.env` file. Use **Secrets management** instead.
+
+1. Push the repo to GitHub (`.env` is gitignored — confirm it's absent before pushing).
+2. Go to [share.streamlit.io](https://share.streamlit.io), connect your repo, and set the main file to `new work/app.py`.
+3. In the app settings → **Secrets**, paste your credentials in TOML format:
+
+```toml
+CONSUMER_KEY = "your_etrade_consumer_key"
+CONSUMER_SECRET = "your_etrade_consumer_secret"
+APP_PASSWORD = "your_chosen_password"
+```
+
+The app reads `st.secrets` first and falls back to env vars, so local dev (`.env`) and cloud (Secrets) both work without code changes.
+
+---
+
+### Security notes
+
+**What's protected:**
+
+- Password comparison uses `hmac.compare_digest()` — resistant to timing attacks.
+- Login is locked for 15 minutes after 5 failed attempts per session.
+- Sessions expire after 8 hours of inactivity.
+- CSRF protection is enabled in `config.toml`.
+- Consumer key/secret never leave `session_state` (cleared on disconnect).
+
+**For self-hosting (VPS / home server) — must-do:**
+
+- Put the app behind a reverse proxy (nginx or Caddy) with a TLS certificate. Never expose port 8501 directly to the internet.
+- Example Caddy config:
+  ```
+  your.domain.com {
+      reverse_proxy localhost:8501
+  }
+  ```
+- Optionally restrict access by IP in your firewall — since only you access it, this dramatically reduces attack surface even before the password prompt.
+
+**Things to be aware of:**
+
+- `data/portfolio_cache.json` and `data/thesis.json` are plaintext JSON on disk. On Streamlit Cloud these live in the app's ephemeral filesystem (lost on restart). On a VPS, ensure the server itself is secured.
+- The password gate is a session-scoped single shared secret, not per-user authentication. Anyone who knows the password can access all data. That's fine for personal use.
+- News links from yfinance are rendered as clickable Markdown links. Streamlit does not execute JavaScript from rendered Markdown, so XSS is not a concern.
