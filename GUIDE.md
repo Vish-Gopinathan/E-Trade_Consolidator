@@ -439,3 +439,88 @@ Close any previously opened version of the file before re-running. XlsxWriter ca
 ### Rate limiting
 
 The script calls `list_transaction_details` once per trade in a loop with no backoff. Accounts with many trades in a single 89-day window may hit E-Trade's rate limits. If transactions are missing, wait a minute and re-run.
+
+---
+
+## Streamlit Dashboard
+
+The project includes a browser-based dashboard at `new work/app.py`. It shows all the same data as the Excel output but live, in your browser, from anywhere.
+
+### Installation
+
+```bash
+pip install streamlit plotly yfinance
+# or install everything at once:
+pip install -r "new work/requirements.txt"
+```
+
+### Configuration
+
+Add the following to your root `.env` file (same one that holds `CONSUMER_KEY` and `CONSUMER_SECRET`):
+
+```
+APP_PASSWORD=choose_a_password_here
+```
+
+### Running locally
+
+```bash
+cd "new work"
+streamlit run app.py
+```
+
+The app opens at `http://localhost:8501`.
+
+### Running remotely (VPS or home server)
+
+```bash
+cd "new work"
+streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+```
+
+Then access it at `http://your-server-ip:8501`. Consider putting it behind a reverse proxy (nginx, Caddy) with HTTPS for production use.
+
+### Connecting to E-Trade
+
+1. Open the app and enter your password.
+2. In the sidebar, click **Get Authorization URL** — this generates a fresh OAuth request.
+3. Click **Authorize on E-Trade ↗** — this opens E-Trade's login page in a new tab.
+4. After authorizing, E-Trade shows a verifier code. Paste it into the sidebar and click **Connect**.
+5. Once connected (🟢 badge), set the date range and click **🔄 Refresh Data**.
+
+The refresh fetches all holdings and transactions live and saves a snapshot to `data/portfolio_cache.json`. If you close the browser and reopen, the app loads from cache automatically (🟡 Cached badge) — no re-authentication needed until the cache is stale.
+
+### Pages
+
+| Page | Description |
+|------|-------------|
+| Home | Portfolio KPIs + top holdings snapshot |
+| Holdings | Full holdings table + allocation & sector charts |
+| Analytics | Performance, concentration, risk metrics + charts |
+| Transactions | Filterable transaction history with pagination |
+| Cash Flows & Income | Cash flow timeline + income breakdown by month/type |
+| News & Earnings | Upcoming earnings calendar + per-stock news feed |
+| Thesis Tracker | Per-holding investment thesis with status tracking |
+
+### Thesis Tracker
+
+The thesis tracker stores data in `data/thesis.json` (auto-created). For each holding you can record:
+
+- **Status** — Unreviewed / On Track / Watch / At Risk / Broken / Exited
+- **Thesis** — the core investment case
+- **Entry Rationale** — why you bought it
+- **Key Catalysts** — what to watch for
+- **Target Price** — optional price target
+- **Expected Hold Period** — e.g. "Long-term", "2–3 years"
+- **Notes log** — append-only timestamped notes
+
+The overview table shows all holdings with colour-coded status badges so you can quickly see which positions need attention.
+
+### Data files (gitignored)
+
+| File | Purpose |
+|------|---------|
+| `data/portfolio_cache.json` | Last-fetched portfolio snapshot |
+| `data/thesis.json` | Thesis tracker data |
+
+Both are excluded from git via `.gitignore`.
