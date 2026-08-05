@@ -110,8 +110,10 @@ if run:
 
     # ── Aggregate by symbol ────────────────────────────────────────────────────
 
-    sells['Quantity'] = pd.to_numeric(sells['Quantity'], errors='coerce')
-    sells['Total Value'] = pd.to_numeric(sells['Total Value'], errors='coerce')
+    # E-Trade stores quantity as negative for sells (position decreases); take abs so
+    # shares and proceeds are positive magnitudes throughout the analysis.
+    sells['Quantity'] = pd.to_numeric(sells['Quantity'], errors='coerce').abs()
+    sells['Total Value'] = pd.to_numeric(sells['Total Value'], errors='coerce').abs()
 
     agg = sells.groupby('Symbol').agg(
         Description=('Security Name', 'first'),
@@ -196,7 +198,7 @@ def _color_diff(val):
     return ''
 
 
-styled = display.style.applymap(
+styled = display.style.map(
     _color_diff, subset=['Difference ($)', 'Difference (%)']
 ).format({
     'Shares Sold': '{:,.4g}',

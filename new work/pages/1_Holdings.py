@@ -55,7 +55,7 @@ display_cols = [c for c in [
 ] if c in stocks.columns]
 
 st.subheader('All Holdings')
-styled = stocks[display_cols].sort_values('Market Value', ascending=False).style.applymap(
+styled = stocks[display_cols].sort_values('Market Value', ascending=False).style.map(
     _colorize_gain, subset=[c for c in ['Total Gain', 'Total Gain %'] if c in display_cols]
 ).format({
     'Market Value': '${:,.2f}',
