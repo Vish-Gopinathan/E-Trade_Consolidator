@@ -51,23 +51,33 @@ def _price_reaction(ticker, earnings_date: date):
 # ── FMP path ──────────────────────────────────────────────────────────────────
 
 def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
-    out = {'is_equity': True, 'name': symbol, 'upcoming': None, 'recent': []}
+    out = {'is_equity': True, 'name': symbol, 'upcoming': None, 'recent': [], '_fmp_error': None}
     qt = _quote_type(ticker)
     out['is_equity'] = qt in _EQUITY_TYPES
     if not out['is_equity']:
         return out
 
+    api_key = api_key.strip()
+    rows = []
     try:
         resp = requests.get(
             f'{_FMP_BASE}/historical/earning_calendar/{symbol}',
             params={'apikey': api_key},
             timeout=8,
         )
-        rows = resp.json() if resp.status_code == 200 else []
-    except Exception:
-        rows = []
+        if resp.status_code == 200:
+            rows = resp.json()
+            if not isinstance(rows, list):
+                # FMP sometimes returns {"Error Message": "..."} on bad key
+                out['_fmp_error'] = str(rows)
+                rows = []
+        else:
+            out['_fmp_error'] = f'HTTP {resp.status_code}: {resp.text[:200]}'
+    except Exception as exc:
+        out['_fmp_error'] = str(exc)
 
     today = date.today()
+    future_dates = []
     for row in rows:
         try:
             dt = date.fromisoformat(row['date'])
@@ -78,19 +88,12 @@ def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
         rev_act = row.get('revenue')
         rev_est = row.get('revenueEstimated')
 
-        if dt > today:
-            if out['upcoming'] is None:
-                out['upcoming'] = {
-                    'date': dt.isoformat(),
-                    'eps_estimate': float(eps_est) if eps_est is not None else None,
-                    'revenue_estimate': float(rev_est) if rev_est is not None else None,
-                    'time': row.get('time', ''),
-                }
+        if dt >= today:
+            future_dates.append((dt, eps_est, rev_est, row.get('time', '')))
         elif eps_act is not None and len(out['recent']) < 4:
             surprise = None
             if eps_est and eps_est != 0:
                 surprise = round((eps_act - eps_est) / abs(eps_est) * 100, 2)
-            # Price reaction only for the most recent quarter
             price_chg = _price_reaction(ticker, dt) if len(out['recent']) == 0 else None
             out['recent'].append({
                 'date': dt.isoformat(),
@@ -101,6 +104,17 @@ def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
                 'revenue_estimate': float(rev_est) if rev_est else None,
                 'price_chg_pct': price_chg,
             })
+
+    # Pick the nearest upcoming date
+    if future_dates:
+        future_dates.sort(key=lambda x: x[0])
+        dt, eps_est, rev_est, when = future_dates[0]
+        out['upcoming'] = {
+            'date': dt.isoformat(),
+            'eps_estimate': float(eps_est) if eps_est is not None else None,
+            'revenue_estimate': float(rev_est) if rev_est is not None else None,
+            'time': when,
+        }
 
     return out
 

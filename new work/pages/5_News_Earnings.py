@@ -30,7 +30,7 @@ if holdings_df is None or (hasattr(holdings_df, 'empty') and holdings_df.empty):
 
 all_symbols = sorted(holdings_df[holdings_df['Symbol'] != 'CASH']['Symbol'].unique().tolist())
 
-fmp_key = get_secret('FMP_API_KEY', '')
+fmp_key = get_secret('FMP_API_KEY', '').strip()
 
 earnings_tab, news_tab = st.tabs(['Earnings', 'News Feed'])
 
@@ -38,11 +38,17 @@ earnings_tab, news_tab = st.tabs(['Earnings', 'News Feed'])
 
 with earnings_tab:
     source_label = 'Financial Modeling Prep' if fmp_key else 'yfinance'
-    st.caption(
-        f'Data source: **{source_label}** — cached 4 hours. '
-        f'{"Add FMP_API_KEY to secrets for richer revenue data." if not fmp_key else "Revenue estimates included."} '
-        'Dates are estimates; verify with your broker.'
-    )
+    col_src, col_btn = st.columns([3, 1])
+    with col_src:
+        st.caption(
+            f'Data source: **{source_label}** — cached 4 hours. '
+            f'{"Add FMP_API_KEY to secrets for richer revenue data." if not fmp_key else "Revenue estimates included."} '
+            'Dates are estimates; verify with your broker.'
+        )
+    with col_btn:
+        if st.button('🔄 Force Refresh', help='Clear the 4-hour cache and re-fetch from source'):
+            get_full_earnings_data.clear()
+            st.rerun()
 
     st.info(
         f'Fetching earnings data for {len(all_symbols)} holdings — '
@@ -51,6 +57,13 @@ with earnings_tab:
     )
     with st.spinner(f'Loading… ({len(all_symbols)} symbols)'):
         raw = get_full_earnings_data(tuple(all_symbols), fmp_key=fmp_key)
+
+    # Surface any FMP errors for debugging
+    fmp_errors = {s: v['_fmp_error'] for s, v in raw.items() if v.get('_fmp_error')}
+    if fmp_errors:
+        with st.expander(f'⚠️ API errors ({len(fmp_errors)} symbols) — click to debug'):
+            for sym, err in list(fmp_errors.items())[:5]:
+                st.code(f'{sym}: {err}')
 
     # Split equities vs non-equities
     equities = {s: v for s, v in raw.items() if v.get('is_equity', True)}
