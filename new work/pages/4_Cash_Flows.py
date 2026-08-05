@@ -67,7 +67,7 @@ with cash_tab:
             return ''
 
         st.dataframe(
-            df[display_cols].sort_values('Date', ascending=False).style.applymap(
+            df[display_cols].sort_values('Date', ascending=False).style.map(
                 _color_flow, subset=['Total Value'] if 'Total Value' in display_cols else []
             ).format(fmt, na_rep='—'),
             use_container_width=True,

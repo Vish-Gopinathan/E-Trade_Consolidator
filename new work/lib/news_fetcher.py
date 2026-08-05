@@ -108,19 +108,23 @@ def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
 # ── yfinance path ─────────────────────────────────────────────────────────────
 
 def _yf_calendar_upcoming(ticker):
+    """Fallback: try ticker.calendar for an upcoming earnings date."""
     try:
         cal = ticker.calendar
         if cal is None or (hasattr(cal, 'empty') and cal.empty):
             return None
-        now = pd.Timestamp.now()
+        today = date.today()
         for key in ('Earnings Date', 'earnings_date'):
             if hasattr(cal, 'index') and key in cal.index:
                 val = cal.loc[key]
-                dt = val.iloc[0] if hasattr(val, 'iloc') else val
-                if pd.notna(dt):
-                    ts = pd.Timestamp(dt)
-                    if ts > now:
-                        return ts.date()
+                raw = val.iloc[0] if hasattr(val, 'iloc') else val
+                if pd.notna(raw):
+                    try:
+                        dt = pd.Timestamp(raw).date()
+                        if dt >= today:
+                            return dt
+                    except Exception:
+                        pass
     except Exception:
         pass
     return None
@@ -133,7 +137,6 @@ def _yf_fetch_one(symbol: str, ticker) -> dict:
     if not out['is_equity']:
         return out
 
-    now_utc = pd.Timestamp.now(tz='UTC')
     dates_df = None
     try:
         dates_df = ticker.get_earnings_dates(limit=16)
@@ -141,38 +144,44 @@ def _yf_fetch_one(symbol: str, ticker) -> dict:
         pass
 
     if dates_df is not None and not dates_df.empty:
-        future = dates_df[dates_df.index > now_utc]
-        if not future.empty:
-            row = future.iloc[-1]  # df sorted desc; last = nearest upcoming
-            eps_est = row.get('EPS Estimate')
-            out['upcoming'] = {
-                'date': row.name.date().isoformat(),
-                'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
-                'revenue_estimate': None,
-                'time': '',
-            }
+        today = date.today()
 
-        past = dates_df[dates_df.index <= now_utc]
-        for dt_idx, row in past.iterrows():
-            if len(out['recent']) >= 4:
-                break
+        # Iterate in descending order (nearest future last, so overwriting gives nearest upcoming)
+        for dt_idx, row in dates_df.iterrows():
+            try:
+                # .date() works safely on both tz-aware and tz-naive Timestamps
+                dt = dt_idx.date()
+            except Exception:
+                continue
+
             eps_act = row.get('Reported EPS')
             eps_est = row.get('EPS Estimate')
             surprise = row.get('Surprise(%)')
-            if pd.isna(eps_act) and pd.isna(eps_est):
-                continue
-            earnings_date = dt_idx.date()
-            # Price reaction only for the most recent quarter (first iteration)
-            price_chg = _price_reaction(ticker, earnings_date) if len(out['recent']) == 0 else None
-            out['recent'].append({
-                'date': earnings_date.isoformat(),
-                'eps_actual': float(eps_act) if pd.notna(eps_act) else None,
-                'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
-                'surprise_pct': float(surprise) if pd.notna(surprise) else None,
-                'revenue_actual': None,
-                'revenue_estimate': None,
-                'price_chg_pct': price_chg,
-            })
+
+            if dt >= today:
+                # Upcoming or announcing today — keep overwriting so we end up with nearest date
+                out['upcoming'] = {
+                    'date': dt.isoformat(),
+                    'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
+                    'revenue_estimate': None,
+                    'time': '',
+                }
+            else:
+                # Past earnings
+                if len(out['recent']) >= 4:
+                    continue
+                if pd.isna(eps_act) and pd.isna(eps_est):
+                    continue
+                price_chg = _price_reaction(ticker, dt) if len(out['recent']) == 0 else None
+                out['recent'].append({
+                    'date': dt.isoformat(),
+                    'eps_actual': float(eps_act) if pd.notna(eps_act) else None,
+                    'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
+                    'surprise_pct': float(surprise) if pd.notna(surprise) else None,
+                    'revenue_actual': None,
+                    'revenue_estimate': None,
+                    'price_chg_pct': price_chg,
+                })
 
     if out['upcoming'] is None:
         fallback = _yf_calendar_upcoming(ticker)
