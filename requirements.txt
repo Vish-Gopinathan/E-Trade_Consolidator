@@ -1,8 +1,8 @@
-pyetrade==2.1.1
-pandas==2.2.3
-numpy==2.1.2
-xlsxwriter==3.2.9
-python-dotenv==0.15.0
-streamlit==1.50.0
-plotly==6.5.2
-yfinance==1.2.0
+pyetrade>=2.1.1
+pandas>=2.2.3
+numpy>=2.1.2
+xlsxwriter>=3.2.9
+python-dotenv>=0.15.0
+streamlit>=1.35.0
+plotly>=5.0.0
+yfinance>=0.2.40
