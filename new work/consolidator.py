@@ -288,7 +288,7 @@ def add_totals_row(consolidated_df):
 TRADE_TYPES = ['Bought', 'Sold']
 
 # Types that are always income, never external cash flows
-INCOME_TYPES = ['Dividend', 'Interest', 'Fee', 'Refund']
+INCOME_TYPES = ['Dividend', 'Qualified Dividend', 'Interest', 'Interest Income', 'Fee', 'Refund']
 
 # Types that are unambiguously external cash movements (sign of amount determines direction)
 EXTERNAL_CASH_TYPES = ['Electronic Funds Transfer', 'Check', 'Wire', 'ACH',

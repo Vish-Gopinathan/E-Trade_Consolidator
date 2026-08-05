@@ -49,7 +49,10 @@ def _records_to_df(records):
         if col in _DATE_COLS:
             df[col] = pd.to_datetime(df[col], errors='coerce')
         else:
-            df[col] = pd.to_numeric(df[col], errors='ignore')
+            try:
+                df[col] = pd.to_numeric(df[col])
+            except (ValueError, TypeError):
+                pass
     return df
 
 
