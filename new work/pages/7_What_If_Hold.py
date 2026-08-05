@@ -9,7 +9,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.common import require_auth, render_sidebar_status
-from lib.news_fetcher import get_current_prices
+from lib.news_fetcher import get_current_prices, get_split_history, cumulative_split_factor
 
 st.set_page_config(page_title='What-If: Hold Analysis', page_icon='🔮', layout='wide')
 require_auth()
@@ -115,9 +115,35 @@ if run:
     sells['Quantity'] = pd.to_numeric(sells['Quantity'], errors='coerce').abs()
     sells['Total Value'] = pd.to_numeric(sells['Total Value'], errors='coerce').abs()
 
+    # ── Fetch split history and adjust share counts ────────────────────────────
+
+    symbols_for_splits = tuple(sorted(sells['Symbol'].unique().tolist()))
+    with st.spinner(f'Fetching price and split data for {len(symbols_for_splits)} symbol(s)…'):
+        prices = get_current_prices(symbols_for_splits)
+        split_hist = get_split_history(symbols_for_splits)
+
+    # Apply cumulative split factor per transaction row.
+    # A sell of 100 NVDA shares in 2023 before the 10:1 June-2024 split would
+    # represent 1,000 equivalent shares today — the factor corrects for this.
+    def _sell_date(row):
+        try:
+            return row['Date'].date()
+        except Exception:
+            return pd.Timestamp(row['Date']).date()
+
+    sells['_split_factor'] = sells.apply(
+        lambda r: cumulative_split_factor(
+            split_hist.get(r['Symbol'], pd.Series(dtype=float)),
+            _sell_date(r),
+        ),
+        axis=1,
+    )
+    sells['_adj_shares'] = sells['Quantity'] * sells['_split_factor']
+
     agg = sells.groupby('Symbol').agg(
         Description=('Security Name', 'first'),
-        Shares_Sold=('Quantity', 'sum'),
+        Shares_Sold=('Quantity', 'sum'),        # original pre-split count at time of sale
+        Shares_Held=('_adj_shares', 'sum'),     # split-adjusted equivalent today
         Total_Proceeds=('Total Value', 'sum'),
         First_Sell=('Date', 'min'),
         Last_Sell=('Date', 'max'),
@@ -125,15 +151,11 @@ if run:
     ).reset_index()
 
     agg['Avg_Sale_Price'] = agg['Total_Proceeds'] / agg['Shares_Sold']
-
-    # ── Fetch current prices ───────────────────────────────────────────────────
-
-    symbols_tuple = tuple(sorted(agg['Symbol'].tolist()))
-    with st.spinner(f'Fetching current prices for {len(symbols_tuple)} symbol(s)…'):
-        prices = get_current_prices(symbols_tuple)
+    # Weighted average split factor across all sell tranches for display
+    agg['Split_Factor'] = (agg['Shares_Held'] / agg['Shares_Sold']).round(4)
 
     agg['Current_Price'] = agg['Symbol'].map(prices)
-    agg['Current_Value'] = agg['Shares_Sold'] * agg['Current_Price']
+    agg['Current_Value'] = agg['Shares_Held'] * agg['Current_Price']   # uses adjusted shares
     agg['Difference'] = agg['Current_Value'] - agg['Total_Proceeds']
     agg['Difference_Pct'] = (agg['Difference'] / agg['Total_Proceeds']) * 100
 
@@ -177,17 +199,30 @@ if not unavailable.empty:
 st.markdown('---')
 st.markdown('### Position Detail')
 
-display = valid[[
-    'Symbol', 'Description', 'Shares_Sold', 'Avg_Sale_Price',
-    'Total_Proceeds', 'Current_Price', 'Current_Value',
-    'Difference', 'Difference_Pct',
-]].copy()
+has_splits = (valid['Split_Factor'] != 1.0).any()
 
-display.columns = [
-    'Symbol', 'Description', 'Shares Sold', 'Avg Sale Price',
-    'Total Proceeds', 'Current Price', 'Current Value if Held',
-    'Difference ($)', 'Difference (%)',
-]
+if has_splits:
+    display = valid[[
+        'Symbol', 'Description', 'Shares_Sold', 'Split_Factor', 'Shares_Held',
+        'Avg_Sale_Price', 'Total_Proceeds', 'Current_Price', 'Current_Value',
+        'Difference', 'Difference_Pct',
+    ]].copy()
+    display.columns = [
+        'Symbol', 'Description', 'Orig Shares', 'Split Factor', 'Equiv Shares Today',
+        'Avg Sale Price', 'Total Proceeds', 'Current Price', 'Current Value if Held',
+        'Difference ($)', 'Difference (%)',
+    ]
+else:
+    display = valid[[
+        'Symbol', 'Description', 'Shares_Sold', 'Avg_Sale_Price',
+        'Total_Proceeds', 'Current_Price', 'Current_Value',
+        'Difference', 'Difference_Pct',
+    ]].copy()
+    display.columns = [
+        'Symbol', 'Description', 'Shares Sold', 'Avg Sale Price',
+        'Total Proceeds', 'Current Price', 'Current Value if Held',
+        'Difference ($)', 'Difference (%)',
+    ]
 
 
 def _color_diff(val):
@@ -198,19 +233,38 @@ def _color_diff(val):
     return ''
 
 
-styled = display.style.map(
-    _color_diff, subset=['Difference ($)', 'Difference (%)']
-).format({
-    'Shares Sold': '{:,.4g}',
+fmt = {
     'Avg Sale Price': '${:,.2f}',
     'Total Proceeds': '${:,.2f}',
     'Current Price': '${:,.2f}',
     'Current Value if Held': '${:,.2f}',
     'Difference ($)': '${:+,.2f}',
     'Difference (%)': '{:+.2f}%',
-}, na_rep='N/A')
+}
+if has_splits:
+    fmt['Orig Shares'] = '{:,.4g}'
+    fmt['Equiv Shares Today'] = '{:,.4g}'
+    fmt['Split Factor'] = '{:.4g}×'
+else:
+    fmt['Shares Sold'] = '{:,.4g}'
+
+styled = display.style.map(
+    _color_diff, subset=['Difference ($)', 'Difference (%)']
+).format(fmt, na_rep='N/A')
 
 st.dataframe(styled, use_container_width=True, hide_index=True)
+
+if has_splits:
+    split_syms = valid[valid['Split_Factor'] != 1.0][['Symbol', 'Split_Factor']].copy()
+    notes = ', '.join(
+        f"{row['Symbol']} ({row['Split_Factor']:.4g}×)"
+        for _, row in split_syms.iterrows()
+    )
+    st.caption(
+        f'⚡ Split-adjusted: {notes} — '
+        '"Equiv Shares Today" reflects cumulative stock splits since the sale date. '
+        '"Current Value if Held" uses the adjusted share count.'
+    )
 
 # ── Bar chart ──────────────────────────────────────────────────────────────────
 
