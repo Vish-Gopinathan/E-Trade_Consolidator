@@ -501,6 +501,50 @@ The refresh fetches all holdings and transactions live and saves a snapshot to `
 | Cash Flows & Income | Cash flow timeline + income breakdown by month/type |
 | News & Earnings | Upcoming earnings calendar + per-stock news feed |
 | Thesis Tracker | Per-holding investment thesis with status tracking |
+| What-If: Hold | Value of sold positions had they been held |
+| Portfolio History | Daily portfolio value rebuilt from transaction history |
+
+### Portfolio History
+
+E\*TRADE reports only the portfolio as it stands today. This page reconstructs the
+end-of-day value for every trading day since your first transaction, and breaks it
+down by symbol, sector, asset type, or open/closed status.
+
+**How it works.** Share counts are walked *backwards* from today's holdings:
+
+```
+shares(day − 1) = (shares(day) − net shares traded that day) ÷ split ratio that day
+```
+
+Anchoring on today rather than building forward from an empty account keeps recent
+values exact by construction. Anything the transaction feed fails to explain — shares
+transferred in from another broker, transactions the API did not return — accumulates
+in the distant past instead, where the page reports it as a residual under **Data
+quality** rather than silently absorbing it into the numbers.
+
+Prices are official daily closes. Yahoo returns them **split-adjusted** even with
+`auto_adjust=False`, so share counts are converted to today's share basis before
+valuation; dividends are deliberately left unadjusted because they were paid out as
+cash and already appear in the reconstructed cash balance.
+
+**Symbol resolution.** Valuing a past position needs a ticker, and older cached
+transaction pulls carry only the security description. Resolution runs: the API's own
+`Symbol` column → a saved manual map → matching against current holdings. Whatever is
+left over gets an **Identify automatically** pass that proposes a ticker and then
+checks it against the prices you actually paid — a candidate whose daily high/low
+range brackets every one of your fills is confirmed by evidence rather than by name
+similarity. Proposals are shown with a confidence score for review before saving;
+nothing is written without confirmation.
+
+Refreshing transactions from the home page populates tickers directly from the API and
+removes the need for mapping altogether.
+
+| Module | Role |
+|--------|------|
+| `lib/portfolio_history.py` | Backward share walk, cash reconstruction, breakout grouping |
+| `lib/price_store.py` | Incremental daily close / split / metadata cache |
+| `lib/symbol_resolver.py` | Description → ticker resolution and price-based verification |
+| `lib/viz_theme.py` | Validated categorical palette and chart styling |
 
 ### Thesis Tracker
 
@@ -522,8 +566,12 @@ The overview table shows all holdings with colour-coded status badges so you can
 |------|---------|
 | `data/portfolio_cache.json` | Last-fetched portfolio snapshot |
 | `data/thesis.json` | Thesis tracker data |
+| `data/price_store.json` | Daily closes, splits and symbol metadata for Portfolio History |
+| `data/symbol_map.json` | Confirmed security-description → ticker mappings |
 
-Both are excluded from git via `.gitignore`.
+All are excluded from git via `.gitignore`. Deleting `price_store.json` is safe — it
+is a cache and refetches on the next visit. Deleting `symbol_map.json` discards
+confirmed ticker mappings, which then have to be re-identified.
 
 ---
 
