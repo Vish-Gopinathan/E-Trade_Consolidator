@@ -56,22 +56,26 @@ def _refresh_data(start_date, end_date):
         st.write('📊 Fetching holdings and cash balances…')
         try:
             all_holdings = []
-            total_cash = 0.0
+            total_account_balance = 0.0  # authoritative total — matches E*TRADE website
             for key in active_accounts['accountIdKey']:
                 df = c.get_portfolio(accounts_obj, key)
                 all_holdings.append(df)
-                total_cash += c.get_cash_balance(accounts_obj, key)
-            holdings_df = c.consolidate_holdings(
-                pd.concat(all_holdings, ignore_index=True),
-                cash=total_cash,
-            )
+                totals = c.get_account_totals(accounts_obj, key)
+                total_account_balance += totals['account_balance']
+
+            combined_df = pd.concat(all_holdings, ignore_index=True)
+            # Derive cash as the residual: account total minus what positions already account for
+            total_positions_value = combined_df['Market Value'].sum()
+            cash_for_display = max(total_account_balance - total_positions_value, 0.0)
+
+            holdings_df = c.consolidate_holdings(combined_df, cash=cash_for_display)
         except Exception as e:
             status.update(label='Failed to fetch holdings', state='error', expanded=True)
             st.error(f'Failed to fetch holdings: {e}')
             return
 
         n_holdings = len(holdings_df[holdings_df['Symbol'] != 'CASH']) if not holdings_df.empty else 0
-        st.write(f'✅ Holdings loaded — {n_holdings} positions, ${total_cash:,.2f} cash')
+        st.write(f'✅ Holdings loaded — {n_holdings} positions, ${cash_for_display:,.2f} cash')
 
         # ── Step 3: transactions with progress bar ────────────────────────────
         days = (end_date - start_date).days + 1
@@ -132,7 +136,7 @@ def _refresh_data(start_date, end_date):
                 cash_flows_df if not cash_flows_df.empty else None,
             )
             analytics_report = analytics.generate_full_report()
-            summary = c.portfolio_summary(holdings_df, cash=total_cash)
+            summary = c.portfolio_summary(holdings_df, cash=cash_for_display)
         except Exception as e:
             status.update(label='Failed to compute analytics', state='error', expanded=True)
             st.error(f'Failed to compute analytics: {e}')

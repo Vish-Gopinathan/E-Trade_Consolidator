@@ -121,15 +121,38 @@ def get_portfolio(accounts_obj, account_id_key):
 def get_cash_balance(accounts_obj, account_id_key):
     """
     Retrieve cash balance for a specific account.
-    
+
     Parameters:
     accounts_obj (pyetrade.ETradeAccounts): E*TRADE Accounts object
     account_id_key (str): Unique account identifier
-    
+
     Returns:
     float: Net cash balance for the account
     """
     return accounts_obj.get_account_balance(account_id_key, resp_format='json')['BalanceResponse']['Computed']['netCash']
+
+def get_account_totals(accounts_obj, account_id_key):
+    """
+    Return the authoritative account balance and net cash from the balance API.
+
+    accountBalance matches what E*TRADE shows as "Total Account Value" on their
+    website; it includes all positions, cash, and pending settlements in one figure.
+    netCash is the free uninvested cash only and can differ from accountBalance.
+
+    Parameters:
+    accounts_obj (pyetrade.ETradeAccounts): E*TRADE Accounts object
+    account_id_key (str): Unique account identifier
+
+    Returns:
+    dict: {'account_balance': float, 'net_cash': float}
+    """
+    computed = accounts_obj.get_account_balance(
+        account_id_key, resp_format='json'
+    )['BalanceResponse']['Computed']
+    return {
+        'account_balance': float(computed.get('accountBalance', 0) or 0),
+        'net_cash': float(computed.get('netCash', 0) or 0),
+    }
 
 def consolidate_holdings(df, cash=0):
     """
