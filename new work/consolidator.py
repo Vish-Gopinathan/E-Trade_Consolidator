@@ -373,7 +373,9 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
     all_transactions = []
     for chunk_start, chunk_end in _date_chunks(start_date, end_date):
         try:
-            resp = accounts_obj.list_transactions(account_id_key, chunk_start, chunk_end)
+            resp = accounts_obj.list_transactions(
+                account_id_key, chunk_start, chunk_end, resp_format='json'
+            )
             chunk_txns = resp.get('TransactionListResponse', {}).get('Transaction', [])
             if chunk_txns:
                 all_transactions.extend(chunk_txns)
@@ -395,8 +397,13 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
         if t_type in TRADE_TYPES:
             # Trades: fetch details for quantity and price
             transaction_id = transaction['transactionId']
-            details_response = accounts_obj.list_transaction_details(account_id_key, transaction_id)
-            details = details_response.get('TransactionDetailsResponse', {}).get('Brokerage', {})
+            try:
+                details_response = accounts_obj.list_transaction_details(
+                    account_id_key, transaction_id, resp_format='json'
+                )
+                details = details_response.get('TransactionDetailsResponse', {}).get('Brokerage', {})
+            except Exception:
+                details = {}
 
             quantity = details.get('quantity')
             price = details.get('price')

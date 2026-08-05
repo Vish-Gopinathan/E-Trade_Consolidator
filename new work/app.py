@@ -25,21 +25,30 @@ st.set_page_config(
 # ── Helper ────────────────────────────────────────────────────────────────────
 
 def _refresh_data(start_date, end_date):
+    import math
     import consolidator as c
     import analytics as a
 
     auth_tokens = st.session_state['auth_tokens']
 
-    with st.spinner('Fetching accounts…'):
+    with st.status('Refreshing portfolio data…', expanded=True) as status:
+
+        # ── Step 1: accounts ─────────────────────────────────────────────────
+        st.write('🔗 Connecting to E-Trade…')
         try:
             active_accounts, accounts_obj = c.fetch_active_accounts(auth_tokens)
             st.session_state['active_accounts'] = active_accounts
             st.session_state['accounts_obj'] = accounts_obj
         except Exception as e:
+            status.update(label='Connection failed', state='error', expanded=True)
             st.error(f'Failed to fetch accounts: {e}')
             return
 
-    with st.spinner('Fetching holdings…'):
+        n_accounts = len(active_accounts)
+        st.write(f'✅ Found {n_accounts} active account(s)')
+
+        # ── Step 2: holdings ─────────────────────────────────────────────────
+        st.write('📊 Fetching holdings and cash balances…')
         try:
             all_holdings = []
             total_cash = 0.0
@@ -52,19 +61,56 @@ def _refresh_data(start_date, end_date):
                 cash=total_cash,
             )
         except Exception as e:
+            status.update(label='Failed to fetch holdings', state='error', expanded=True)
             st.error(f'Failed to fetch holdings: {e}')
             return
 
-    with st.spinner('Fetching transactions…'):
+        n_holdings = len(holdings_df[holdings_df['Symbol'] != 'CASH']) if not holdings_df.empty else 0
+        st.write(f'✅ Holdings loaded — {n_holdings} positions, ${total_cash:,.2f} cash')
+
+        # ── Step 3: transactions with progress bar ────────────────────────────
+        days = (end_date - start_date).days + 1
+        n_chunks = max(1, math.ceil(days / 89))
+        total_steps = n_accounts * n_chunks
+        st.write(
+            f'🔄 Fetching transactions ({start_date} → {end_date}, '
+            f'{n_chunks} date chunk(s) × {n_accounts} account(s))…'
+        )
+        progress = st.progress(0, text='Starting transaction fetch…')
+
         try:
-            transactions_df = c.get_all_consolidated_transactions(
-                accounts_obj, active_accounts, start_date, end_date
-            )
+            all_txn_frames = []
+            for acct_idx, key in enumerate(active_accounts['accountIdKey']):
+                progress.progress(
+                    acct_idx / n_accounts,
+                    text=f'Account {acct_idx + 1}/{n_accounts} — fetching transactions…',
+                )
+                acct_txns = c.get_consolidated_transactions(accounts_obj, key, start_date, end_date)
+                all_txn_frames.append(acct_txns)
+                progress.progress(
+                    (acct_idx + 1) / n_accounts,
+                    text=f'Account {acct_idx + 1}/{n_accounts} — done',
+                )
+
+            progress.progress(1.0, text='All accounts processed')
+
+            if all_txn_frames:
+                transactions_df = pd.concat(all_txn_frames, ignore_index=True)
+                if not transactions_df.empty and 'Date' in transactions_df.columns:
+                    transactions_df = transactions_df.sort_values('Date', ascending=False).reset_index(drop=True)
+            else:
+                transactions_df = pd.DataFrame()
+
         except Exception as e:
+            status.update(label='Failed to fetch transactions', state='error', expanded=True)
             st.error(f'Failed to fetch transactions: {e}')
             return
 
-    with st.spinner('Computing analytics…'):
+        n_txns = len(transactions_df)
+        st.write(f'✅ Transactions loaded — {n_txns:,} record(s)')
+
+        # ── Step 4: analytics ─────────────────────────────────────────────────
+        st.write('🧮 Computing analytics…')
         try:
             cash_flows_df = c.get_cash_flows(transactions_df)
             income_df = None
@@ -83,8 +129,12 @@ def _refresh_data(start_date, end_date):
             analytics_report = analytics.generate_full_report()
             summary = c.portfolio_summary(holdings_df, cash=total_cash)
         except Exception as e:
+            status.update(label='Failed to compute analytics', state='error', expanded=True)
             st.error(f'Failed to compute analytics: {e}')
             return
+
+        st.write('✅ Analytics complete')
+        status.update(label='Portfolio data refreshed!', state='complete', expanded=False)
 
     fetched_at = datetime.datetime.now().isoformat()
     portfolio = {
@@ -107,7 +157,6 @@ def _refresh_data(start_date, end_date):
     except Exception:
         pass
 
-    st.success('Data refreshed!')
     st.rerun()
 
 
