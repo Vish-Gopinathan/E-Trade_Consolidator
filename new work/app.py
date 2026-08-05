@@ -1,4 +1,5 @@
 import hmac
+import io
 import os
 import sys
 import datetime
@@ -14,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from lib.etrade_session import get_oauth_url, complete_oauth
 from lib.data_cache import save_portfolio, load_portfolio
-from lib.common import render_sidebar_status, get_secret
+from lib.common import render_sidebar_status, get_secret, is_guest
+from lib.github_cache import save_snapshot, load_snapshot
 
 _MAX_LOGIN_ATTEMPTS = 5
 _LOCKOUT_MINUTES = 15
@@ -184,6 +186,7 @@ if st.session_state.get('authenticated'):
 # ── Password gate ────────────────────────────────────────────────────────────
 
 APP_PASSWORD = get_secret('APP_PASSWORD')
+GUEST_PASSWORD = get_secret('GUEST_PASSWORD', '')
 
 if not st.session_state.get('authenticated'):
     st.title('Portfolio Dashboard')
@@ -200,6 +203,13 @@ if not st.session_state.get('authenticated'):
     if st.button('Login') or pwd:
         if APP_PASSWORD and hmac.compare_digest(pwd.encode(), APP_PASSWORD.encode()):
             st.session_state.authenticated = True
+            st.session_state.role = 'admin'
+            st.session_state.login_attempts = 0
+            st.session_state.last_activity = datetime.datetime.now()
+            st.rerun()
+        elif GUEST_PASSWORD and hmac.compare_digest(pwd.encode(), GUEST_PASSWORD.encode()):
+            st.session_state.authenticated = True
+            st.session_state.role = 'guest'
             st.session_state.login_attempts = 0
             st.session_state.last_activity = datetime.datetime.now()
             st.rerun()
@@ -222,6 +232,11 @@ if 'portfolio' not in st.session_state:
     cached = load_portfolio()
     if cached:
         st.session_state.portfolio = cached
+    else:
+        snapshot = load_snapshot(get_secret)
+        if snapshot:
+            st.session_state.portfolio = snapshot
+            st.session_state._is_snapshot = True
 
 # ── Sidebar: E-Trade connection + refresh ────────────────────────────────────
 
@@ -230,65 +245,103 @@ with st.sidebar:
 
     render_sidebar_status()
 
-    st.markdown('---')
-    with st.expander('🔌 E-Trade Connection', expanded=not st.session_state.get('etrade_connected')):
-        if not st.session_state.get('etrade_connected'):
-            if st.button('Get Authorization URL'):
-                try:
-                    url, oauth_obj, ck, cs = get_oauth_url()
-                    st.session_state['_oauth_obj'] = oauth_obj
-                    st.session_state['_consumer_key'] = ck
-                    st.session_state['_consumer_secret'] = cs
-                    st.session_state['_oauth_url'] = url
-                except Exception as e:
-                    st.error(f'Failed to get OAuth URL: {e}')
-
-            if st.session_state.get('_oauth_url'):
-                st.link_button('Authorize on E-Trade ↗', st.session_state['_oauth_url'])
-                verifier = st.text_input('Paste verifier code', key='verifier_input')
-                if st.button('Connect') and verifier.strip():
-                    try:
-                        tokens = complete_oauth(
-                            st.session_state['_oauth_obj'],
-                            verifier.strip(),
-                            st.session_state['_consumer_key'],
-                            st.session_state['_consumer_secret'],
-                        )
-                        st.session_state['auth_tokens'] = tokens
-                        st.session_state['etrade_connected'] = True
-                        for k in ('_oauth_obj', '_consumer_key', '_consumer_secret', '_oauth_url'):
-                            st.session_state.pop(k, None)
-                        st.success('Connected!')
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f'Connection failed: {e}')
-        else:
-            st.success('Connected to E-Trade')
-            if st.button('Disconnect'):
-                for k in ('etrade_connected', 'auth_tokens', 'active_accounts', 'accounts_obj'):
-                    st.session_state.pop(k, None)
-                st.rerun()
-
-    if st.session_state.get('etrade_connected'):
+    if is_guest():
+        st.sidebar.info('👁️ Guest view — read-only')
+    else:
+        # Admin-only: E-Trade connection
         st.markdown('---')
-        st.markdown('**Refresh Data**')
-        start_date = st.date_input(
-            'Start date',
-            value=datetime.date(2000, 1, 1),
-            min_value=datetime.date(1990, 1, 1),
-            max_value=datetime.date.today(),
-            key='refresh_start',
-        )
-        end_date = st.date_input(
-            'End date',
-            value=datetime.date.today(),
-            min_value=datetime.date(1990, 1, 1),
-            max_value=datetime.date.today(),
-            key='refresh_end',
-        )
+        with st.expander('🔌 E-Trade Connection', expanded=not st.session_state.get('etrade_connected')):
+            if not st.session_state.get('etrade_connected'):
+                if st.button('Get Authorization URL'):
+                    try:
+                        url, oauth_obj, ck, cs = get_oauth_url()
+                        st.session_state['_oauth_obj'] = oauth_obj
+                        st.session_state['_consumer_key'] = ck
+                        st.session_state['_consumer_secret'] = cs
+                        st.session_state['_oauth_url'] = url
+                    except Exception as e:
+                        st.error(f'Failed to get OAuth URL: {e}')
 
-        if st.button('🔄 Refresh Data', type='primary'):
-            _refresh_data(start_date, end_date)
+                if st.session_state.get('_oauth_url'):
+                    st.link_button('Authorize on E-Trade ↗', st.session_state['_oauth_url'])
+                    verifier = st.text_input('Paste verifier code', key='verifier_input')
+                    if st.button('Connect') and verifier.strip():
+                        try:
+                            tokens = complete_oauth(
+                                st.session_state['_oauth_obj'],
+                                verifier.strip(),
+                                st.session_state['_consumer_key'],
+                                st.session_state['_consumer_secret'],
+                            )
+                            st.session_state['auth_tokens'] = tokens
+                            st.session_state['etrade_connected'] = True
+                            for k in ('_oauth_obj', '_consumer_key', '_consumer_secret', '_oauth_url'):
+                                st.session_state.pop(k, None)
+                            st.success('Connected!')
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f'Connection failed: {e}')
+            else:
+                st.success('Connected to E-Trade')
+                if st.button('Disconnect'):
+                    for k in ('etrade_connected', 'auth_tokens', 'active_accounts', 'accounts_obj'):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+
+        if st.session_state.get('etrade_connected'):
+            st.markdown('---')
+            st.markdown('**Refresh Data**')
+            start_date = st.date_input(
+                'Start date',
+                value=datetime.date(2000, 1, 1),
+                min_value=datetime.date(1990, 1, 1),
+                max_value=datetime.date.today(),
+                key='refresh_start',
+            )
+            end_date = st.date_input(
+                'End date',
+                value=datetime.date.today(),
+                min_value=datetime.date(1990, 1, 1),
+                max_value=datetime.date.today(),
+                key='refresh_end',
+            )
+
+            if st.button('🔄 Refresh Data', type='primary'):
+                _refresh_data(start_date, end_date)
+
+        # Admin-only: Save month-end snapshot
+        if st.session_state.get('portfolio'):
+            st.markdown('---')
+            with st.expander('📅 Month-End Snapshot'):
+                st.caption(
+                    'Save current portfolio data as the month-end snapshot. '
+                    'Guest users and cold-start sessions will see this data.'
+                )
+                if st.button('💾 Save as Month-End Snapshot'):
+                    _snap = dict(st.session_state.portfolio)
+                    _snap['snapshot_date'] = datetime.date.today().isoformat()
+                    try:
+                        save_portfolio(
+                            _snap.get('holdings'),
+                            _snap.get('transactions'),
+                            _snap.get('cash_flows'),
+                            _snap.get('income'),
+                            _snap.get('analytics_report'),
+                            _snap.get('summary'),
+                            _snap.get('fetched_at', ''),
+                        )
+                    except Exception:
+                        pass
+                    ok = save_snapshot(_snap, get_secret)
+                    if ok:
+                        st.success(f'Snapshot saved — {datetime.date.today():%B %d, %Y}')
+                        st.session_state.portfolio['snapshot_date'] = _snap['snapshot_date']
+                        st.session_state._is_snapshot = False
+                    else:
+                        st.warning(
+                            'Saved to local disk only. '
+                            'Add GITHUB_TOKEN and GITHUB_REPO secrets to persist across restarts.'
+                        )
 
 # ── Home page ─────────────────────────────────────────────────────────────────
 
@@ -297,13 +350,30 @@ st.title('Portfolio Dashboard')
 portfolio = st.session_state.get('portfolio')
 
 if not portfolio:
-    st.info('No data loaded. Connect to E-Trade and click **Refresh Data**, or check that `data/portfolio_cache.json` exists.')
+    if is_guest():
+        st.warning(
+            'No portfolio snapshot is available yet. '
+            'Ask the account owner to save a month-end snapshot.',
+            icon='📅',
+        )
+    else:
+        st.info('No data loaded. Connect to E-Trade and click **Refresh Data**, or check that `data/portfolio_cache.json` exists.')
     st.stop()
 
 summary = portfolio.get('summary') or {}
 fetched_at = portfolio.get('fetched_at', '')
 
-if fetched_at:
+# Status banner
+if st.session_state.get('_is_snapshot'):
+    snap_date = portfolio.get('snapshot_date', fetched_at[:10])
+    st.info(
+        f'Viewing month-end snapshot as of **{snap_date}**. '
+        'Connect to E-Trade and refresh for live data.',
+        icon='📅',
+    )
+elif is_guest():
+    st.info('Guest view — read-only. Contact the account owner to refresh data.', icon='👁️')
+elif fetched_at:
     ts = fetched_at[:19].replace('T', ' ')
     label = '🟢 Live data' if st.session_state.get('etrade_connected') else '🟡 Cached data'
     st.caption(f'{label} — last updated {ts}')
@@ -374,3 +444,56 @@ if analytics_report:
         n_inc = inc_summary.get('Number of Income Transactions')
         if n_inc:
             st.metric('Income Transactions', n_inc)
+
+# ── Excel download ────────────────────────────────────────────────────────────
+
+st.markdown('---')
+st.subheader('Download')
+
+holdings_df = portfolio.get('holdings')
+txns_df = portfolio.get('transactions')
+cf_df = portfolio.get('cash_flows')
+income_df = portfolio.get('income')
+file_date = portfolio.get('snapshot_date', fetched_at[:10] if fetched_at else datetime.date.today().isoformat())
+
+dl1, dl2 = st.columns(2)
+
+with dl1:
+    if st.button('Generate Holdings & Transactions Excel', key='gen_holdings_xl'):
+        try:
+            import consolidator as c
+            buf = io.BytesIO()
+            c.export_to_excel(
+                holdings_df,
+                transactions_df=txns_df if txns_df is not None and not (hasattr(txns_df, 'empty') and txns_df.empty) else None,
+                cash_flows_df=cf_df if cf_df is not None and not (hasattr(cf_df, 'empty') and cf_df.empty) else None,
+                income_df=income_df if income_df is not None and not (hasattr(income_df, 'empty') and income_df.empty) else None,
+                filename=buf,
+            )
+            buf.seek(0)
+            st.download_button(
+                '⬇ Download Holdings Excel',
+                buf,
+                f'portfolio_{file_date}.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key='dl_holdings',
+            )
+        except Exception as e:
+            st.error(f'Failed to generate Excel: {e}')
+
+with dl2:
+    if st.button('Generate Analytics Excel', key='gen_analytics_xl'):
+        try:
+            import analytics as a
+            buf = io.BytesIO()
+            a.export_analytics_to_excel(holdings_df, analytics_report, filename=buf)
+            buf.seek(0)
+            st.download_button(
+                '⬇ Download Analytics Excel',
+                buf,
+                f'analytics_{file_date}.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key='dl_analytics',
+            )
+        except Exception as e:
+            st.error(f'Failed to generate Excel: {e}')

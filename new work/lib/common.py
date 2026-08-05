@@ -39,12 +39,20 @@ def require_auth():
         st.stop()
 
 
+def is_guest() -> bool:
+    return st.session_state.get('role') == 'guest'
+
+
 def render_sidebar_status():
     st.sidebar.markdown('---')
     if st.session_state.get('_demo_mode'):
         st.sidebar.info('🎭 Demo mode — fictional data')
     elif st.session_state.get('etrade_connected'):
         st.sidebar.success('🟢 Live — E-Trade connected')
+    elif st.session_state.get('_is_snapshot'):
+        portfolio = st.session_state.get('portfolio') or {}
+        snap_date = portfolio.get('snapshot_date', portfolio.get('fetched_at', '')[:10])
+        st.sidebar.info(f'📅 Month-end snapshot — {snap_date}')
     elif st.session_state.get('portfolio'):
         fetched_at = st.session_state.portfolio.get('fetched_at', '')
         st.sidebar.warning(f'🟡 Cached — last updated {fetched_at[:10] if fetched_at else "unknown"}')
