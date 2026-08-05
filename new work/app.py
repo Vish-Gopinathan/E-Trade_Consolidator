@@ -272,8 +272,7 @@ with st.sidebar:
     if st.session_state.get('etrade_connected'):
         st.markdown('---')
         st.markdown('**Refresh Data**')
-        default_start = datetime.date(datetime.date.today().year, 1, 1)
-        start_date = st.date_input('Start date', value=default_start, key='refresh_start')
+        start_date = st.date_input('Start date', value=datetime.date(2000, 1, 1), key='refresh_start')
         end_date = st.date_input('End date', value=datetime.date.today(), key='refresh_end')
 
         if st.button('🔄 Refresh Data', type='primary'):
