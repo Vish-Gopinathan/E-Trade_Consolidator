@@ -124,7 +124,7 @@ def _refresh_data(start_date, end_date):
             analytics = a.PortfolioAnalytics(
                 holdings_df,
                 transactions_df if not transactions_df.empty else None,
-                income_df,
+                cash_flows_df if not cash_flows_df.empty else None,
             )
             analytics_report = analytics.generate_full_report()
             summary = c.portfolio_summary(holdings_df, cash=total_cash)
