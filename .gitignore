@@ -1,3 +1,7 @@
-outputs
+outputs/
+archive/
 Keys.txt
 .env
+*.xlsx
+*.json
+!sectors.json

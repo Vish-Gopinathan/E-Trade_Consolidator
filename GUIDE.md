@@ -1,9 +1,8 @@
-# E-Trade Portfolio Consolidator - Developer & User Guide
+# E-Trade Portfolio Consolidator — Developer & User Guide
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
@@ -11,7 +10,6 @@
 - [Module Reference](#module-reference)
 - [Data Flow](#data-flow)
 - [Excel Output Format](#excel-output-format)
-- [Analytics Engine](#analytics-engine)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
 
@@ -19,30 +17,19 @@
 
 ## Overview
 
-A Python application that consolidates investment holdings across multiple E-Trade brokerage accounts into a single unified view. It connects to the E-Trade API via OAuth, aggregates positions by symbol, calculates performance metrics, runs portfolio analytics, and exports professionally formatted Excel reports.
+A Python application that consolidates investment holdings across multiple E-Trade brokerage accounts into a single unified view. It connects to the E-Trade API via OAuth, aggregates positions by symbol, classifies transactions (trades, deposits, withdrawals, income), calculates deposit-adjusted performance using the Modified Dietz method, runs portfolio analytics, and exports professionally formatted Excel reports.
 
 ### What It Does
 
 - Authenticates with E-Trade via OAuth 2.0 (browser-based)
-- Pulls holdings and cash balances from all active accounts
+- Pulls holdings and cash balances from **all active accounts**
 - Merges duplicate positions across accounts (same symbol held in multiple accounts)
 - Calculates weighted average cost basis, gain/loss, and portfolio allocation
-- Retrieves transaction history (buys and sells)
+- Retrieves full transaction history across **all accounts** in arbitrary date ranges (automatically chunks into 89-day windows to comply with the API limit)
+- Classifies transactions: Trades, Deposits, Withdrawals, Income (dividends/interest), Internal (excluded)
+- Calculates deposit-adjusted return (Modified Dietz) separating investment gains from cash contributions
 - Generates risk and concentration analytics
 - Exports everything to formatted `.xlsx` files
-
----
-
-## Architecture
-
-The project has two implementation tiers:
-
-| Tier | Location | Purpose |
-|------|----------|---------|
-| **Original** | `Portfolio Consolidator.py` | Single-file script, self-contained |
-| **Modular** | `new work/` | Refactored into separate modules with analytics |
-
-The **modular** version (`new work/`) is the recommended entry point. It separates concerns into distinct modules and adds the analytics engine. The original script is functionally identical but keeps everything in one file.
 
 ---
 
@@ -50,18 +37,21 @@ The **modular** version (`new work/`) is the recommended entry point. It separat
 
 ```
 E-Trade consolidator/
-├── Portfolio Consolidator.py       # Original single-file implementation
 ├── GUIDE.md                        # This file
 ├── .env                            # API credentials (gitignored)
-├── .gitignore                      # Excludes secrets and outputs
+├── .gitignore
 │
-└── new work/                       # Modular refactor (recommended)
-    ├── main.py                     # Orchestrator entry point
-    ├── consolidator.py             # Core data retrieval and consolidation
-    └── analytics.py                # Portfolio analytics engine
+├── new work/                       # Active modular codebase
+│   ├── main.py                     # Orchestrator entry point (run this)
+│   ├── consolidator.py             # Core data retrieval, consolidation, and transaction classification
+│   ├── analytics.py                # Portfolio analytics engine
+│   └── sectors.json                # Editable sector-to-symbol mappings (~140 symbols, 11 sectors)
+│
+├── outputs/                        # Historical Excel exports (gitignored)
+└── archive/                        # Deprecated code kept for reference (gitignored)
 ```
 
-Output files (`.xlsx`) are written to the working directory from which the script is run.
+Output files (`.xlsx`) are written to the directory specified by `--output-dir` (default: current directory).
 
 ---
 
@@ -73,19 +63,17 @@ Output files (`.xlsx`) are written to the working directory from which the scrip
 
 ### Dependencies
 
-Install individually:
-
 ```bash
 pip install pyetrade pandas numpy xlsxwriter python-dotenv
 ```
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `pyetrade` | >=1.0.0 | E-Trade API wrapper |
-| `pandas` | >=1.3.0 | Data manipulation |
-| `numpy` | >=1.20.0 | Numerical operations |
-| `xlsxwriter` | >=3.0.0 | Excel file generation |
-| `python-dotenv` | >=0.19.0 | `.env` file loading |
+| Package | Purpose |
+|---------|---------|
+| `pyetrade` | E-Trade API wrapper |
+| `pandas` | Data manipulation |
+| `numpy` | Numerical operations |
+| `xlsxwriter` | Excel file generation |
+| `python-dotenv` | `.env` file loading |
 
 ---
 
@@ -125,17 +113,27 @@ These are your E-Trade API production keys. Do not commit this file (it is liste
 
 ## Usage
 
-### Running the Original Script
-
-```bash
-python "Portfolio Consolidator.py"
-```
-
-### Running the Modular Version (Recommended)
-
 ```bash
 cd "new work"
 python main.py
+```
+
+### CLI Options
+
+```
+python main.py [--start YYYY-MM-DD] [--end YYYY-MM-DD] [--output-dir DIR]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--start` | Jan 1 of current year | Start date for transaction history |
+| `--end` | Today | End date for transaction history |
+| `--output-dir` | `.` (current directory) | Where to write Excel output files |
+
+Example — pull all of 2025:
+
+```bash
+python main.py --start 2025-01-01 --end 2025-12-31 --output-dir ~/reports/
 ```
 
 ### What Happens at Runtime
@@ -144,23 +142,24 @@ python main.py
 2. Log in and authorize the application
 3. Copy the verification code from the browser
 4. Paste the code into the terminal prompt
-5. The script fetches all account data, consolidates it, and exports Excel files
-6. A portfolio summary prints to the terminal
+5. Holdings, cash balances, and transactions are fetched across all active accounts
+6. Console prints a portfolio summary and transaction/income counts
+7. Two Excel files are written to the output directory
 
 ### Output Files
 
-Two Excel files are generated in the working directory:
-
-- `portfolio_consolidated_YYYY-MM-DD.xlsx` -- Holdings, summary, and transactions
-- `portfolio_analytics_YYYY-MM-DD.xlsx` -- Analytics report (modular version only)
+| File | Contents |
+|------|----------|
+| `portfolio_consolidated_YYYY-MM-DD.xlsx` | Holdings, Transactions, Cash Flows, Income sheets |
+| `portfolio_analytics_YYYY-MM-DD.xlsx` | Analytics Summary and Holdings Detail sheets |
 
 ---
 
 ## Module Reference
 
-### `consolidator.py` / `Portfolio Consolidator.py`
+### `consolidator.py`
 
-These two files contain identical logic. `consolidator.py` is imported by `new work/main.py`; `Portfolio Consolidator.py` runs standalone.
+Core data retrieval, consolidation, and transaction classification.
 
 #### `authenticate_etrade() -> dict`
 
@@ -172,21 +171,21 @@ Calls `list_accounts()`, filters to `accountStatus == 'ACTIVE'`. Returns a DataF
 
 #### `get_portfolio(accounts_obj, account_id_key) -> DataFrame`
 
-Fetches the complete portfolio for one account. Extracts per-position data:
+Fetches the complete portfolio for one account using the `Complete` view. Returns one row per position:
 
-| Column | Type | Source |
-|--------|------|--------|
-| Symbol | str | `Product.symbol` |
-| Symbol Description | str | `Complete.symbolDescription` |
-| Current Price | float | `Complete.price` |
-| Quantity | float | `position.quantity` |
-| Date Acquired | datetime | `position.dateAcquired` (epoch ms) |
-| Price Paid | float | `position.pricePaid` |
-| Total Cost | float | `position.totalCost` |
-| Market Value | float | `position.marketValue` |
-| Total Gain | float | `position.totalGain` |
-| Total Gain % | float | `position.totalGainPct` |
-| Percent of Portfolio | float | `position.pctOfPortfolio` |
+| Column | Source |
+|--------|--------|
+| Symbol | `Product.symbol` |
+| Symbol Description | `Complete.symbolDescription` |
+| Current Price | `Complete.price` |
+| Quantity | `position.quantity` |
+| Date Acquired | `position.dateAcquired` (epoch ms → datetime) |
+| Price Paid | `position.pricePaid` |
+| Total Cost | `position.totalCost` |
+| Market Value | `position.marketValue` |
+| Total Gain | `position.totalGain` |
+| Total Gain % | `position.totalGainPct` |
+| Percent of Portfolio | `position.pctOfPortfolio` |
 
 #### `get_cash_balance(accounts_obj, account_id_key) -> float`
 
@@ -194,124 +193,132 @@ Returns `netCash` from the account balance endpoint.
 
 #### `consolidate_holdings(df, cash=0) -> DataFrame`
 
-Groups positions by `Symbol` across all accounts. Aggregates:
-- `Quantity`: sum
-- `Total Cost`: sum
-- `Market Value`: sum
-- `Date Acquired`: earliest (min)
-- `Current Price`: max (latest)
-- `Price Paid`: recalculated as `Total Cost / Quantity` (weighted average)
-
-Recalculates `Total Gain`, `Total Gain %`, and `Percent of Portfolio`. Appends a `CASH` row if `cash > 0`. Sorts by `Market Value` descending.
+Groups positions by `Symbol` across all accounts. Aggregates quantity, cost, and market value; recalculates weighted average price paid, total gain, gain %, and portfolio allocation. Appends a `CASH` row if `cash > 0`. Sorts by market value descending.
 
 #### `portfolio_summary(consolidated_df, cash=0) -> dict`
 
-Returns summary stats:
-- Total stock count, market value, cost basis
-- Total unrealized gain ($ and %)
-- Cash amount and percentage
-- Top 3 holdings by market value
+Returns summary stats: stock count, total market value and cost basis, total unrealized gain ($ and %), cash amount and percentage, and top 3 holdings by market value.
+
+#### `_date_chunks(start_date, end_date, chunk_days=89)`
+
+Generator that splits `[start_date, end_date]` into consecutive windows of at most `chunk_days`. Used internally to work around the E-Trade API's 90-day limit on `list_transactions`.
 
 #### `get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_date) -> DataFrame`
 
-Fetches buy/sell transactions for one account. Calls `list_transactions()` then `list_transaction_details()` for each. Both `start_date` and `end_date` must be `datetime.date` objects.
+Fetches **all** transactions for one account. Automatically chunks the date range into 89-day windows and merges results. Classifies every transaction into a `Category`:
 
-Returns columns: `Date`, `Security Name`, `Quantity`, `Price`, `Total Value`, `Transaction Type`.
+| Category | Transaction Types |
+|----------|-----------------|
+| `Trade` | `Bought`, `Sold` — details fetched via `list_transaction_details` |
+| `Deposit` | External money in: `Electronic Funds Transfer`, `ACH`, `Wire`, `Check`, `Contribution`, or description contains `"ACH DEPOSIT"` |
+| `Withdrawal` | External money out: same types with negative amount, or `Distribution` |
+| `Income` | `Dividend`, `Interest`, `Fee`, `Refund` |
+| `Internal` | `Journal` with no external signal — **excluded from all output** |
+| `Other` | Unrecognised types with no clear signal |
+
+Returns columns: `Date`, `Security Name`, `Quantity`, `Price`, `Total Value`, `Transaction Type`, `Category`.
+
+#### `_classify_non_trade(t_type, description, amount) -> str`
+
+Priority-based classifier for non-trade transactions. See category table above. Called internally by `get_consolidated_transactions`.
 
 #### `get_all_consolidated_transactions(accounts_obj, active_accounts, start_date, end_date) -> DataFrame`
 
-Loops over all active accounts, concatenates transaction DataFrames, sorts by date descending.
+Loops over all active accounts and concatenates their transaction DataFrames. Sorted newest-first.
 
-#### `export_to_excel(consolidated_df, transactions_df=None, filename=None, summary_spacing=3)`
+#### `get_cash_flows(transaction_df) -> DataFrame`
 
-Writes a formatted `.xlsx` file using XlsxWriter:
-- **Holdings sheet**: Position data with currency/percentage formatting
-- **Summary section**: Below the holdings table with portfolio totals
-- **Transactions sheet**: Included if `transactions_df` is provided
-- Auto-adjusts column widths
+Filters a full transaction DataFrame to only `Deposit` and `Withdrawal` rows. Returns columns `Date`, `Description`, `Total Value`, `Category`. Used as input for Modified Dietz return calculations.
 
-Default filename: `portfolio_consolidated_YYYY-MM-DD.xlsx`
+#### `export_to_excel(consolidated_df, transactions_df=None, cash_flows_df=None, income_df=None, filename=None, summary_spacing=3)`
+
+Writes a formatted `.xlsx` file with up to four sheets:
+
+| Sheet | Condition | Contents |
+|-------|-----------|----------|
+| Holdings | Always | Position data with currency/percentage formatting + summary block |
+| Transactions | If `transactions_df` provided | All trades and classified non-trade transactions |
+| Cash Flows | If `cash_flows_df` provided | Deposits (green) and withdrawals (red) with totals |
+| Income | If `income_df` provided | Dividends (gold) and interest (blue) with per-type totals |
+
+Default filename: `portfolio_consolidated_YYYY-MM-DD.xlsx`.
 
 ---
 
 ### `analytics.py`
 
+Portfolio analytics engine. All methods return plain dicts; the class performs no API calls.
+
 #### Class: `PortfolioAnalytics`
 
 ```python
-analytics = PortfolioAnalytics(consolidated_df, transactions_df=None, risk_free_rate=0.04)
+analytics = PortfolioAnalytics(
+    consolidated_df,          # from consolidate_holdings()
+    transactions_df=None,     # from get_all_consolidated_transactions()
+    cash_flows_df=None,       # from get_cash_flows() — derived automatically if None
+    risk_free_rate=0.04       # annual rate for Sharpe/Sortino (default 4%)
+)
 ```
 
-Separates holdings from the CASH row internally. All methods return plain dicts.
+Internal attributes:
+- `self.holdings` — positions only (CASH row excluded)
+- `self.cash` — cash balance as a float
+- `self.cash_flows` — Deposit/Withdrawal rows (derived from `transactions_df` if `cash_flows_df` not provided)
+- `self.income` — Income-category rows (dividends, interest)
 
 #### `concentration_analysis() -> dict`
 
-Measures portfolio diversification:
-- **HHI Score**: Herfindahl-Hirschman Index (sum of squared allocation percentages). Range 0-10000.
-  - < 1500: Well Diversified
-  - < 2500: Moderately Diversified
-  - < 5000: Concentrated
-  - >= 5000: Highly Concentrated
-- **Effective Positions**: `10000 / HHI`. Represents how many equally-weighted positions the portfolio behaves like.
-- **Top N Holdings %**: Concentration of top 3, 5, and 10 positions.
-- **Diversification Score**: Ratio of actual to effective positions.
+HHI Score, Effective Positions, Top 3/5/10 Holdings %, Diversification Score.
+
+HHI interpretation: < 1500 Well Diversified, < 2500 Moderately Diversified, < 5000 Concentrated, ≥ 5000 Highly Concentrated.
 
 #### `sector_analysis() -> dict`
 
-Maps symbols to predefined sector groups (Tech, Finance, Healthcare, Consumer, Energy, Utilities, ETFs). Returns dollar and percentage allocation per sector. Unmatched symbols go to "Other".
-
-Note: Sector mappings are hardcoded. Update the `sector_groups` dictionary in `sector_analysis()` if your portfolio contains symbols not in the default lists.
+Maps symbols to sectors loaded from `sectors.json` (falls back to built-in defaults if missing). Returns dollar and percentage allocation per sector. Unmatched symbols go to `Other`. To add symbols, edit `sectors.json` — no Python changes needed.
 
 #### `performance_metrics() -> dict`
 
-- Total return ($ and %)
-- Unrealized vs realized gains (realized calculated from sell transactions)
-- Total cost basis and current market value
-- Average cost per position
+- Simple return ($ and %) based on cost basis vs. current market value
+- **Deposit-Adjusted Return (Modified Dietz)**: accounts for the timing of deposits and withdrawals so cash contributions are not mistaken for investment gains
+  - Formula: `R = (EMV - BMV - CF) / (BMV + Σ(CF_i × W_i))`
+  - BMV approximated as total cost basis (no period-start snapshot available)
+- Total Deposits, Total Withdrawals, Net Cash Flows
+
+#### `cash_flow_summary() -> dict`
+
+Deposit and withdrawal counts, totals, largest transaction, and most recent date for each direction.
+
+#### `income_summary() -> dict`
+
+Total income received, broken down by type (Dividend, Interest, etc.) with counts and most recent payment date. Income is generated inside the account and does not affect deposit-adjusted return.
 
 #### `risk_metrics() -> dict`
 
-- **Volatility**: Standard deviation of position gain percentages
-- **Downside Deviation**: Std dev of only negative returns
-- **Win Rate**: Percentage of positions with positive gains
-- **Best/Worst Performer**: Max and min gain %
-- **Sharpe Ratio**: `(avg_return - risk_free_rate) / volatility`
-- **Sortino Ratio**: `(avg_return - risk_free_rate) / downside_deviation`
+Volatility (std dev of position gain %s), Downside Deviation, Win Rate, Best/Worst Performer, Sharpe Ratio, Sortino Ratio.
 
-Note: These ratios use position-level gain percentages rather than time-series returns (simplified approach).
+Note: ratios use position-level gain percentages as a simplified proxy for time-series returns.
 
 #### `liquidity_analysis() -> dict`
 
-Evaluates cash position. Returns cash balance, percentage, and a liquidity score (65-85 scale):
-- > 30% cash: 85
-- > 20% cash: 80
-- > 10% cash: 75
-- > 5% cash: 70
-- Otherwise: 65
+Cash balance, cash percentage, and a liquidity score (65–85).
 
 #### `transaction_analysis() -> dict`
 
-Counts buys/sells, total amounts, portfolio turnover, and average transaction size. Returns a message if no transaction data is available.
+Buy/sell counts, total amounts, portfolio turnover, and average transaction size.
 
 #### `holdings_quality_analysis() -> dict`
 
-Categorizes positions into gain/loss buckets:
-- Highly Profitable (> 50%), Profitable (0-50%), Breakeven
-- Small Loss (-10% to 0%), Moderate Loss (-50% to -10%), Major Loss (< -50%)
-
-Identifies best and worst performers.
+Positions bucketed by gain %: Highly Profitable (>50%), Profitable (0–50%), Breakeven, Small Loss, Moderate Loss, Major Loss. Identifies best and worst performers.
 
 #### `generate_full_report() -> dict`
 
-Runs all analysis methods and returns a combined dictionary.
+Runs all methods and returns a combined dict with keys: Concentration Analysis, Sector Analysis, Performance Metrics, Cash Flow Summary, Income Summary, Risk Metrics, Liquidity Analysis, Holdings Quality, Transaction Analysis.
 
 #### `export_analytics_to_excel(consolidated_df, analytics_report, filename=None)`
 
-Writes the analytics report to a formatted Excel file with two sheets:
-- **Analytics Summary**: Key-value pairs for all metrics
-- **Holdings Detail**: Full position data with performance columns
+Writes the analytics report to Excel with two sheets: **Analytics Summary** (all metrics as key-value pairs with nested dicts expanded) and **Holdings Detail** (full position table).
 
-Default filename: `portfolio_analytics_YYYY-MM-DD.xlsx`
+Default filename: `portfolio_analytics_YYYY-MM-DD.xlsx`.
 
 ---
 
@@ -319,45 +326,50 @@ Default filename: `portfolio_analytics_YYYY-MM-DD.xlsx`
 
 ```
 E-Trade API (OAuth 2.0)
-    |
-    v
-fetch_active_accounts() --> list of account IDs
-    |
-    v
-For each account:
-    get_portfolio()      --> raw positions DataFrame
-    get_cash_balance()   --> float
-    |
-    v
-pd.concat(all accounts) --> combined DataFrame
-    |
-    v
-consolidate_holdings()  --> grouped by Symbol, gains recalculated
-    |
-    v
-portfolio_summary()     --> dict of summary stats
-    |
-    v
-get_all_consolidated_transactions() --> transaction DataFrame
-    |
-    v
-export_to_excel()       --> portfolio_consolidated_YYYY-MM-DD.xlsx
-    |
-    v
-PortfolioAnalytics()    --> analytics object
-    |
-    v
-generate_full_report()  --> dict of all analytics
-    |
-    v
-export_analytics_to_excel() --> portfolio_analytics_YYYY-MM-DD.xlsx
+    │
+    ▼
+fetch_active_accounts()         → list of account IDs (all active accounts)
+    │
+    ▼
+For each account (in parallel loops):
+    get_portfolio()             → raw positions DataFrame
+    get_cash_balance()          → float
+    │
+    ▼
+pd.concat(all accounts)         → combined DataFrame
+    │
+    ▼
+consolidate_holdings()          → grouped by Symbol, gains recalculated, CASH row appended
+    │
+    ▼
+portfolio_summary()             → dict of summary stats (printed to terminal)
+    │
+    ▼
+get_all_consolidated_transactions()   → all transactions across all accounts
+    │                                   (auto-chunked into 89-day windows)
+    ├── get_cash_flows()         → Deposit/Withdrawal rows only
+    └── income rows (inline)    → Income rows (Dividend/Interest)
+    │
+    ▼
+export_to_excel()               → portfolio_consolidated_YYYY-MM-DD.xlsx
+    │                             (Holdings + Transactions + Cash Flows + Income sheets)
+    ▼
+PortfolioAnalytics()            → analytics object
+    │
+    ▼
+generate_full_report()          → dict of all analytics sections
+    │
+    ▼
+export_analytics_to_excel()     → portfolio_analytics_YYYY-MM-DD.xlsx
 ```
 
 ---
 
 ## Excel Output Format
 
-### Holdings Sheet
+### `portfolio_consolidated_*.xlsx`
+
+**Holdings sheet**
 
 | Column | Format | Description |
 |--------|--------|-------------|
@@ -370,54 +382,31 @@ export_analytics_to_excel() --> portfolio_analytics_YYYY-MM-DD.xlsx
 | Total Cost | $#,##0.00 | Total amount invested |
 | Market Value | $#,##0.00 | Current total value |
 | Total Gain | $#,##0.00 | Unrealized gain/loss |
-| Total Gain % | 0.00% | Return percentage |
-| Percent of Portfolio | 0.00% | Allocation weight |
+| Total Gain % | 0.00 | Return percentage (whole number, e.g. 21.47 = 21.47%) |
+| Percent of Portfolio | 0.00 | Allocation weight (whole number) |
 
-### Summary Section (below holdings)
+Followed by a summary block with totals, cash, and total portfolio value.
 
-Written as key-value pairs: Total Stocks, Total Quantity, Total Cost, Total Market Value, Total Gain/Loss, Total Gain/Loss %, Cash, Total Portfolio Value, Cash %.
+**Transactions sheet** — all transaction types with `Category` column.
 
-### Transactions Sheet (optional)
+**Cash Flows sheet** — Deposits highlighted green, Withdrawals red. Summary block with Total Deposited, Total Withdrawn, Net Cash Flow.
 
-| Column | Format |
-|--------|--------|
-| Date | YYYY-MM-DD |
-| Security Name | Text |
-| Quantity | Number |
-| Price | $#,##0.00 |
-| Total Value | $#,##0.00 |
-| Transaction Type | Bought/Sold |
+**Income sheet** — Dividends highlighted gold, Interest blue. Summary with per-type subtotals.
 
----
+### `portfolio_analytics_*.xlsx`
 
-## Analytics Engine
+**Analytics Summary** — all metrics as a two-column key/value table. Nested dicts are expanded with indented sub-rows.
 
-The `analytics.py` module provides seven analytical perspectives on the consolidated portfolio. It is only available when running the modular version (`new work/main.py`).
-
-All methods can be run individually or via `generate_full_report()`, which returns a combined dict. The results are written to `portfolio_analytics_YYYY-MM-DD.xlsx` with an Analytics Summary sheet and a Holdings Detail sheet.
-
-The analytics engine is read-only and does not call any external APIs. It works entirely from the consolidated DataFrame produced by `consolidator.py`.
+**Holdings Detail** — full position data.
 
 ---
 
 ## Security
 
-### Credentials
-
-- API keys are stored in `.env` and loaded via `python-dotenv`
-- `.env` and `Keys.txt` are excluded from version control via `.gitignore`
-- OAuth tokens are obtained at runtime and not persisted to disk
-- The application uses production E-Trade endpoints (`dev=False`)
-
-### API Access Scope
-
-The application only performs **read** operations:
-- `list_accounts` -- account enumeration
-- `get_account_portfolio` -- holdings data
-- `get_account_balance` -- cash balances
-- `list_transactions` / `list_transaction_details` -- transaction history
-
-No trades, transfers, or account modifications are made.
+- API keys stored in `.env`, loaded via `python-dotenv`, excluded from version control
+- OAuth tokens obtained at runtime, not persisted to disk
+- Application uses production E-Trade endpoints (`dev=False`)
+- **Read-only API calls only**: `list_accounts`, `get_account_portfolio`, `get_account_balance`, `list_transactions`, `list_transaction_details` — no trades or transfers
 
 ---
 
@@ -425,39 +414,28 @@ No trades, transfers, or account modifications are made.
 
 ### OAuth authorization fails
 
-- Verify your `CONSUMER_KEY` and `CONSUMER_SECRET` in `.env` are correct
-- Ensure your E-Trade API application is approved for production access
-- The verification code expires quickly -- enter it promptly after authorization
+Verify `CONSUMER_KEY` and `CONSUMER_SECRET` in `.env` are correct. The verification code expires quickly — enter it promptly after authorizing.
 
-### "start_date must be a datetime.date object"
+### Empty or incomplete transaction data
 
-Pass `datetime.date` objects, not strings:
+The API limits each `list_transactions` call to a 90-day window. The code automatically chunks the date range, but if you see warnings like `failed to fetch transactions YYYY-MM-DD – YYYY-MM-DD`, the API may be throttling or returning errors for that window.
 
-```python
-import datetime
-start = datetime.date(2025, 1, 1)
-end = datetime.date.today()
-```
+### Deposits not appearing / wrong classification
 
-### Empty transaction data
+Every non-trade transaction prints a `[TXN]` debug line showing `type`, `description`, `amount`, and resolved `Category`. If a deposit is misclassified, share those lines — the description text drives classification for ambiguous types like `Transfer`.
 
-- The transaction API only returns `Bought` and `Sold` types. Dividends, interest, and transfers are filtered out.
-- Check that the date range covers a period with actual trades.
+### Suspicious withdrawals in Cash Flows
 
-### Missing positions after consolidation
-
-- Only accounts with `accountStatus == 'ACTIVE'` are included
-- Positions with zero quantity may not appear in the API response
-
-### Excel file won't open
-
-- Close any previously opened version of the file before re-running
-- XlsxWriter cannot append to existing files -- it always creates new ones
+These are usually `Journal` entries — internal E-Trade bookkeeping for inter-account movements. `Journal` transactions with no external keywords in their description are classified as `Internal` and excluded. If a real deposit is being excluded, its `[TXN]` line will show `→ Internal`.
 
 ### Sector analysis shows most holdings as "Other"
 
-The sector mappings in `analytics.py` are hardcoded for common large-cap symbols. Update the `sector_groups` dictionary in `sector_analysis()` to include your specific tickers.
+Edit `sectors.json` in the `new work/` directory to add your symbols. No Python changes needed. The file is a simple dict of `{ "Sector Name": ["TICK1", "TICK2", ...] }`.
+
+### Excel file won't open
+
+Close any previously opened version of the file before re-running. XlsxWriter cannot append to existing files — it always creates new ones.
 
 ### Rate limiting
 
-The E-Trade API has rate limits. If fetching transaction details for many transactions, you may hit throttling. The script does not currently implement retry logic or rate-limit backoff.
+The script calls `list_transaction_details` once per trade in a loop with no backoff. Accounts with many trades in a single 89-day window may hit E-Trade's rate limits. If transactions are missing, wait a minute and re-run.
