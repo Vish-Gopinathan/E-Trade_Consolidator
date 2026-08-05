@@ -202,3 +202,19 @@ if no_data:
         f'No earnings data found for: {", ".join(no_data)} '
         '— may be ETFs, funds, or recently listed.'
     )
+
+# ── Debug expander ────────────────────────────────────────────────────────────
+
+with st.expander('🔍 Debug — click to inspect store and errors'):
+    errors = {s: store[s].get('_error') for s in all_symbols if store.get(s) and store[s].get('_error')}
+    if errors:
+        st.markdown('**Fetch errors:**')
+        for sym, err in errors.items():
+            st.code(f'{sym}: {err}')
+    else:
+        st.caption('No errors recorded.')
+
+    st.markdown('**Store snapshot (first 3 symbols):**')
+    for sym in all_symbols[:3]:
+        entry = store.get(sym, 'NOT IN STORE')
+        st.write(f'**{sym}**:', entry)

@@ -126,9 +126,13 @@ def fetch_symbol(symbol: str, existing: dict | None = None) -> dict:
     """
     Fetch earnings for one symbol from yfinance.
     Merges with `existing` to preserve already-stored past quarters (they never change).
+    Only marks last_updated when data is actually retrieved — failed fetches are
+    left with last_updated='2000-01-01' so they are retried on next page load.
     """
     today = date.today()
-    result: dict = {'last_updated': today.isoformat(), 'upcoming': None, 'recent': []}
+    # Start with old last_updated so a failed fetch doesn't cache itself as fresh
+    old_last_updated = (existing or {}).get('last_updated', '2000-01-01')
+    result: dict = {'last_updated': old_last_updated, 'upcoming': None, 'recent': [], '_error': None}
 
     # Carry forward past quarters from existing store
     past_dates: set = set()
@@ -186,28 +190,42 @@ def fetch_symbol(symbol: str, existing: dict | None = None) -> dict:
                     'date': dt.isoformat(),
                     'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        result['_error'] = f'get_earnings_dates: {exc}'
 
     # ── calendar fallback for upcoming ───────────────────────────────────────
     if result['upcoming'] is None:
         try:
             cal = ticker.calendar
             if cal is not None:
-                for key in ('Earnings Date', 'earnings_date'):
-                    if hasattr(cal, 'index') and key in cal.index:
-                        val = cal.loc[key]
-                        raw = val.iloc[0] if hasattr(val, 'iloc') else val
-                        if pd.notna(raw):
-                            dt = pd.Timestamp(raw).date()
-                            if dt >= today:
-                                result['upcoming'] = {
-                                    'date': dt.isoformat(),
-                                    'eps_estimate': None,
-                                }
-                                break
-        except Exception:
-            pass
+                # calendar can be a dict (new yfinance) or a DataFrame (old)
+                if isinstance(cal, dict):
+                    raw_dates = cal.get('Earnings Date') or []
+                    if raw_dates:
+                        raw = raw_dates[0] if isinstance(raw_dates, list) else raw_dates
+                        dt = pd.Timestamp(raw).date() if not isinstance(raw, date) else raw
+                        if dt >= today:
+                            result['upcoming'] = {'date': dt.isoformat(), 'eps_estimate': None}
+                else:
+                    for key in ('Earnings Date', 'earnings_date'):
+                        if hasattr(cal, 'index') and key in cal.index:
+                            val = cal.loc[key]
+                            raw = val.iloc[0] if hasattr(val, 'iloc') else val
+                            if pd.notna(raw):
+                                dt = pd.Timestamp(raw).date()
+                                if dt >= today:
+                                    result['upcoming'] = {
+                                        'date': dt.isoformat(),
+                                        'eps_estimate': None,
+                                    }
+                                    break
+        except Exception as exc:
+            if not result['_error']:
+                result['_error'] = f'calendar: {exc}'
+
+    # Only stamp last_updated when we actually got something useful
+    if result['recent'] or result['upcoming']:
+        result['last_updated'] = today.isoformat()
 
     return result
 
