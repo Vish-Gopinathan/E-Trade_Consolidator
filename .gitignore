@@ -1,11 +1,25 @@
-outputs/
-archive/
-Keys.txt
+# Secrets — never commit
 .env
+.streamlit/secrets.toml
+Keys.txt
+
+# Runtime state: portfolio cache, price/earnings stores, thesis notes, account map.
+# This is real financial data. The repo is public — keep it out.
+data/*
+!data/.gitkeep
+
+# Generated reports
+outputs/
 *.xlsx
-*.json
-!sectors.json
+
+# Local-only history, superseded code
+archive/
+
+# Environments and tooling
+.venv/
+venv/
 __pycache__/
 *.pyc
-.DS_Store
 .claude/
+.DS_Store
+.pytest_cache/

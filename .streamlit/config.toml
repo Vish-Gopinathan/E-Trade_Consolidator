@@ -1,0 +1,17 @@
+[server]
+headless = true
+# enableCORS must stay true: Streamlit refuses to honour enableCORS=false while
+# XSRF protection is on and silently overrides it, so setting it only produced a
+# startup warning and a false sense of configuration.
+enableXsrfProtection = true
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#1f77b4"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1a1f2e"
+textColor = "#fafafa"
+font = "sans serif"

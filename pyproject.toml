@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Tests import `portfolio` and `ui` as top-level packages, the same way
+# `streamlit run app.py` does. Putting the repo root on sys.path keeps the two
+# entry points consistent so a test can never pass against a different import
+# graph than the app uses.
+pythonpath = ["."]
+testpaths = ["tests"]

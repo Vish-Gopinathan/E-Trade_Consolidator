@@ -3,9 +3,14 @@ pandas>=2.2.3
 numpy>=2.1.2
 xlsxwriter>=3.2.9
 python-dotenv>=0.15.0
-streamlit>=1.35.0
+streamlit>=1.36.0
 plotly>=5.0.0
 yfinance>=0.2.40
+
+# yfinance parses the earnings-dates table with pandas.read_html, which needs a
+# parser backend. Without lxml, Ticker.get_earnings_dates() raises ImportError and
+# every symbol silently stores empty earnings data.
+lxml>=5.0.0
 
 # starlette 1.4 changed GZipResponder.__init__, which Streamlit subclasses —
 # every page request 500s under it. Remove the ceiling once Streamlit adapts.
