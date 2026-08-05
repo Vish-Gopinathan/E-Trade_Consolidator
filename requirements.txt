@@ -6,3 +6,7 @@ python-dotenv>=0.15.0
 streamlit>=1.35.0
 plotly>=5.0.0
 yfinance>=0.2.40
+
+# starlette 1.4 changed GZipResponder.__init__, which Streamlit subclasses —
+# every page request 500s under it. Remove the ceiling once Streamlit adapts.
+starlette<1.4
