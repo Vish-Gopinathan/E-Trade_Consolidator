@@ -32,6 +32,8 @@ STATUS_EMOJI = {
 
 
 def require_auth():
+    if st.session_state.get('_demo_mode'):
+        return
     if not st.session_state.get('authenticated'):
         st.error('Please log in from the main page.')
         st.stop()
@@ -39,7 +41,9 @@ def require_auth():
 
 def render_sidebar_status():
     st.sidebar.markdown('---')
-    if st.session_state.get('etrade_connected'):
+    if st.session_state.get('_demo_mode'):
+        st.sidebar.info('🎭 Demo mode — fictional data')
+    elif st.session_state.get('etrade_connected'):
         st.sidebar.success('🟢 Live — E-Trade connected')
     elif st.session_state.get('portfolio'):
         fetched_at = st.session_state.portfolio.get('fetched_at', '')

@@ -1,3 +1,4 @@
+import datetime
 import sys
 from pathlib import Path
 import streamlit as st
@@ -40,8 +41,8 @@ with st.expander('Filters', expanded=True):
             date_range = st.date_input(
                 'Date range',
                 value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date,
+                min_value=datetime.date(1990, 1, 1),
+                max_value=datetime.date.today(),
             )
         else:
             date_range = None
@@ -80,6 +81,11 @@ page = st.number_input('Page', min_value=1, max_value=total_pages, value=1, step
 start_idx = (page - 1) * page_size
 end_idx = start_idx + page_size
 page_df = filtered[display_cols].iloc[start_idx:end_idx]
+
+page_df = page_df.copy()
+for col in ('Total Value', 'Price', 'Quantity'):
+    if col in page_df.columns:
+        page_df[col] = pd.to_numeric(page_df[col], errors='coerce')
 
 fmt = {}
 if 'Total Value' in page_df.columns:

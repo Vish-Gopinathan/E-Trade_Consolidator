@@ -272,8 +272,20 @@ with st.sidebar:
     if st.session_state.get('etrade_connected'):
         st.markdown('---')
         st.markdown('**Refresh Data**')
-        start_date = st.date_input('Start date', value=datetime.date(2000, 1, 1), key='refresh_start')
-        end_date = st.date_input('End date', value=datetime.date.today(), key='refresh_end')
+        start_date = st.date_input(
+            'Start date',
+            value=datetime.date(2000, 1, 1),
+            min_value=datetime.date(1990, 1, 1),
+            max_value=datetime.date.today(),
+            key='refresh_start',
+        )
+        end_date = st.date_input(
+            'End date',
+            value=datetime.date.today(),
+            min_value=datetime.date(1990, 1, 1),
+            max_value=datetime.date.today(),
+            key='refresh_end',
+        )
 
         if st.button('🔄 Refresh Data', type='primary'):
             _refresh_data(start_date, end_date)

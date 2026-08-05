@@ -1,6 +1,5 @@
 from datetime import datetime, date
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import time
 import pandas as pd
 import requests
 import streamlit as st
@@ -25,7 +24,7 @@ def _quote_type(ticker) -> str:
         return 'equity'
 
 
-# ── Price reaction helper ─────────────────────────────────────────────────────
+# ── Price reaction ────────────────────────────────────────────────────────────
 
 def _price_reaction(ticker, earnings_date: date):
     """Return % change from close before earnings to close the next trading day."""
@@ -91,6 +90,8 @@ def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
             surprise = None
             if eps_est and eps_est != 0:
                 surprise = round((eps_act - eps_est) / abs(eps_est) * 100, 2)
+            # Price reaction only for the most recent quarter
+            price_chg = _price_reaction(ticker, dt) if len(out['recent']) == 0 else None
             out['recent'].append({
                 'date': dt.isoformat(),
                 'eps_actual': float(eps_act),
@@ -98,7 +99,7 @@ def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
                 'surprise_pct': surprise,
                 'revenue_actual': float(rev_act) if rev_act else None,
                 'revenue_estimate': float(rev_est) if rev_est else None,
-                'price_chg_pct': _price_reaction(ticker, dt),
+                'price_chg_pct': price_chg,
             })
 
     return out
@@ -106,7 +107,7 @@ def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
 
 # ── yfinance path ─────────────────────────────────────────────────────────────
 
-def _yf_calendar_upcoming(ticker) -> 'date | None':
+def _yf_calendar_upcoming(ticker):
     try:
         cal = ticker.calendar
         if cal is None or (hasattr(cal, 'empty') and cal.empty):
@@ -161,6 +162,8 @@ def _yf_fetch_one(symbol: str, ticker) -> dict:
             if pd.isna(eps_act) and pd.isna(eps_est):
                 continue
             earnings_date = dt_idx.date()
+            # Price reaction only for the most recent quarter (first iteration)
+            price_chg = _price_reaction(ticker, earnings_date) if len(out['recent']) == 0 else None
             out['recent'].append({
                 'date': earnings_date.isoformat(),
                 'eps_actual': float(eps_act) if pd.notna(eps_act) else None,
@@ -168,7 +171,7 @@ def _yf_fetch_one(symbol: str, ticker) -> dict:
                 'surprise_pct': float(surprise) if pd.notna(surprise) else None,
                 'revenue_actual': None,
                 'revenue_estimate': None,
-                'price_chg_pct': _price_reaction(ticker, earnings_date),
+                'price_chg_pct': price_chg,
             })
 
     if out['upcoming'] is None:
@@ -184,8 +187,6 @@ def _yf_fetch_one(symbol: str, ticker) -> dict:
     return out
 
 
-# ── Dispatcher ────────────────────────────────────────────────────────────────
-
 def _fetch_one(symbol: str, fmp_key: str) -> dict:
     ticker = yf.Ticker(symbol)
     if fmp_key:
@@ -198,35 +199,22 @@ def _fetch_one(symbol: str, fmp_key: str) -> dict:
 @st.cache_data(ttl=14400)
 def get_full_earnings_data(symbols: tuple, fmp_key: str = '') -> dict:
     """
-    Return {symbol: data} for all equity symbols.
+    Return {symbol: data} for all equity symbols. Fetches sequentially to
+    avoid yfinance rate limits. Cached 4 hours.
 
-    data = {
-      'is_equity': bool,
-      'name': str,
-      'upcoming': {'date': str, 'eps_estimate': float|None,
-                   'revenue_estimate': float|None, 'time': str} | None,
-      'recent': [{'date': str, 'eps_actual': float|None,
-                  'eps_estimate': float|None, 'surprise_pct': float|None,
-                  'revenue_actual': float|None, 'revenue_estimate': float|None,
-                  'price_chg_pct': float|None}]  # up to 4 quarters
-    }
-
-    Uses FMP API when fmp_key is provided (better coverage + revenue data),
-    otherwise falls back to yfinance get_earnings_dates(). Results cached 4 hours.
-    Fetches all symbols in parallel.
+    Callers should pass a Streamlit progress object via st.progress() before
+    calling; this function does NOT write to Streamlit directly.
     """
     results = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_fetch_one, sym, fmp_key): sym for sym in symbols}
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                results[sym] = fut.result(timeout=25)
-            except Exception:
-                results[sym] = {
-                    'is_equity': True, 'name': sym,
-                    'upcoming': None, 'recent': [],
-                }
+    for symbol in symbols:
+        try:
+            results[symbol] = _fetch_one(symbol, fmp_key)
+        except Exception:
+            results[symbol] = {
+                'is_equity': True, 'name': symbol,
+                'upcoming': None, 'recent': [],
+            }
+        time.sleep(0.3)  # avoid yfinance rate limits on cloud deployments
     return results
 
 

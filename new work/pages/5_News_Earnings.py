@@ -44,7 +44,12 @@ with earnings_tab:
         'Dates are estimates; verify with your broker.'
     )
 
-    with st.spinner(f'Fetching earnings data for {len(all_symbols)} holdings…'):
+    st.info(
+        f'Fetching earnings data for {len(all_symbols)} holdings — '
+        'first load may take 30–90 seconds. Results are cached for 4 hours.',
+        icon='⏳',
+    )
+    with st.spinner(f'Loading… ({len(all_symbols)} symbols)'):
         raw = get_full_earnings_data(tuple(all_symbols), fmp_key=fmp_key)
 
     # Split equities vs non-equities
@@ -112,7 +117,7 @@ with earnings_tab:
     st.subheader('Recent Earnings (last 4 reported quarters per stock)')
 
     recent_rows = []
-    cutoff = today - timedelta(days=180)
+    cutoff = today - timedelta(days=365)
     for sym, data in equities.items():
         for r in data.get('recent', []):
             try:
