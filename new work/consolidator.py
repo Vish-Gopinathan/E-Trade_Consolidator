@@ -431,6 +431,14 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
             quantity = details.get('quantity')
             price = details.get('price')
 
+            # Symbol lives in the Product sub-object of the Brokerage detail
+            product = details.get('Product') or details.get('product') or {}
+            symbol = product.get('symbol', '')
+            # Fall back to top-level brokerage field present on some API responses
+            if not symbol:
+                brokerage_top = transaction.get('brokerage') or {}
+                symbol = (brokerage_top.get('product') or {}).get('symbol', '')
+
             if quantity is not None and price is not None:
                 try:
                     quantity = float(quantity)
@@ -444,6 +452,7 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
             transaction_data.append({
                 'Date': t_date,
                 'Security Name': description,
+                'Symbol': symbol,
                 'Quantity': quantity,
                 'Price': price,
                 'Total Value': total_value,
@@ -471,6 +480,7 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
             transaction_data.append({
                 'Date': t_date,
                 'Security Name': description,
+                'Symbol': '',
                 'Quantity': None,
                 'Price': None,
                 'Total Value': dollar_amount,

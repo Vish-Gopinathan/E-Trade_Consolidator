@@ -18,6 +18,33 @@ def get_earnings_dates(symbols: tuple) -> dict:
     return results
 
 
+@st.cache_data(ttl=300)
+def get_current_prices(symbols: tuple) -> dict:
+    """
+    Return {symbol: current_price_or_None} for each symbol.
+    Tries fast_info first, falls back to recent history.
+    Results cached for 5 minutes.
+    """
+    results = {}
+    for symbol in symbols:
+        try:
+            ticker = yf.Ticker(symbol)
+            price = None
+            try:
+                fi = ticker.fast_info
+                price = getattr(fi, 'last_price', None) or fi.get('lastPrice')
+            except Exception:
+                pass
+            if not price:
+                hist = ticker.history(period='5d')
+                if not hist.empty:
+                    price = float(hist['Close'].iloc[-1])
+            results[symbol] = float(price) if price else None
+        except Exception:
+            results[symbol] = None
+    return results
+
+
 @st.cache_data(ttl=3600)
 def get_news(symbol: str, limit: int = 10) -> list:
     """
