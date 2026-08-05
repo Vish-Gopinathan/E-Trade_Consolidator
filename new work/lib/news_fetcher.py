@@ -6,7 +6,7 @@ import streamlit as st
 import yfinance as yf
 
 _EQUITY_TYPES = {'equity', 'stock', 'reit'}
-_FMP_BASE = 'https://financialmodelingprep.com/api/v3'
+_FMP_STABLE = 'https://financialmodelingprep.com/stable'
 
 
 # ── Quote-type / ETF detection ────────────────────────────────────────────────
@@ -58,63 +58,93 @@ def _fmp_fetch_one(symbol: str, api_key: str, ticker) -> dict:
         return out
 
     api_key = api_key.strip()
-    rows = []
+    today = date.today()
+
+    # ── Historical earnings (stable/earnings endpoint) ────────────────────────
     try:
         resp = requests.get(
-            f'{_FMP_BASE}/historical/earning_calendar/{symbol}',
-            params={'apikey': api_key},
+            f'{_FMP_STABLE}/earnings',
+            params={'symbol': symbol, 'limit': 8, 'apikey': api_key},
             timeout=8,
         )
         if resp.status_code == 200:
             rows = resp.json()
             if not isinstance(rows, list):
-                # FMP sometimes returns {"Error Message": "..."} on bad key
                 out['_fmp_error'] = str(rows)
                 rows = []
         else:
             out['_fmp_error'] = f'HTTP {resp.status_code}: {resp.text[:200]}'
+            rows = []
     except Exception as exc:
         out['_fmp_error'] = str(exc)
+        rows = []
 
-    today = date.today()
-    future_dates = []
     for row in rows:
         try:
             dt = date.fromisoformat(row['date'])
         except Exception:
             continue
+        if dt >= today or len(out['recent']) >= 4:
+            continue
         eps_act = row.get('eps')
         eps_est = row.get('epsEstimated')
         rev_act = row.get('revenue')
         rev_est = row.get('revenueEstimated')
-
-        if dt >= today:
-            future_dates.append((dt, eps_est, rev_est, row.get('time', '')))
-        elif eps_act is not None and len(out['recent']) < 4:
-            surprise = None
-            if eps_est and eps_est != 0:
-                surprise = round((eps_act - eps_est) / abs(eps_est) * 100, 2)
-            price_chg = _price_reaction(ticker, dt) if len(out['recent']) == 0 else None
-            out['recent'].append({
-                'date': dt.isoformat(),
-                'eps_actual': float(eps_act),
-                'eps_estimate': float(eps_est) if eps_est is not None else None,
-                'surprise_pct': surprise,
-                'revenue_actual': float(rev_act) if rev_act else None,
-                'revenue_estimate': float(rev_est) if rev_est else None,
-                'price_chg_pct': price_chg,
-            })
-
-    # Pick the nearest upcoming date
-    if future_dates:
-        future_dates.sort(key=lambda x: x[0])
-        dt, eps_est, rev_est, when = future_dates[0]
-        out['upcoming'] = {
+        if eps_act is None:
+            continue
+        surprise = None
+        if eps_est and eps_est != 0:
+            surprise = round((eps_act - eps_est) / abs(eps_est) * 100, 2)
+        price_chg = _price_reaction(ticker, dt) if len(out['recent']) == 0 else None
+        out['recent'].append({
             'date': dt.isoformat(),
+            'eps_actual': float(eps_act),
             'eps_estimate': float(eps_est) if eps_est is not None else None,
-            'revenue_estimate': float(rev_est) if rev_est is not None else None,
-            'time': when,
-        }
+            'surprise_pct': surprise,
+            'revenue_actual': float(rev_act) if rev_act else None,
+            'revenue_estimate': float(rev_est) if rev_est else None,
+            'price_chg_pct': price_chg,
+        })
+
+    # ── Upcoming earnings (stable/earnings-calendar endpoint) ─────────────────
+    try:
+        to_date = (today + __import__('datetime').timedelta(days=90)).isoformat()
+        resp = requests.get(
+            f'{_FMP_STABLE}/earnings-calendar',
+            params={'from': today.isoformat(), 'to': to_date, 'apikey': api_key},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            cal_rows = resp.json()
+            if isinstance(cal_rows, list):
+                future_dates = []
+                for row in cal_rows:
+                    if row.get('symbol') != symbol:
+                        continue
+                    try:
+                        dt = date.fromisoformat(row['date'])
+                    except Exception:
+                        continue
+                    if dt >= today:
+                        future_dates.append((dt, row))
+                if future_dates:
+                    future_dates.sort(key=lambda x: x[0])
+                    dt, row = future_dates[0]
+                    eps_est = row.get('epsEstimated')
+                    rev_est = row.get('revenueEstimated')
+                    out['upcoming'] = {
+                        'date': dt.isoformat(),
+                        'eps_estimate': float(eps_est) if eps_est is not None else None,
+                        'revenue_estimate': float(rev_est) if rev_est is not None else None,
+                        'time': row.get('time', ''),
+                    }
+    except Exception:
+        pass
+
+    # Fall back to yfinance for upcoming if FMP calendar didn't have this symbol
+    if out['upcoming'] is None:
+        yf_data = _yf_fetch_one(symbol, ticker)
+        out['upcoming'] = yf_data.get('upcoming')
 
     return out
 
