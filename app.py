@@ -198,21 +198,38 @@ def _refresh_data(start_date, end_date) -> None:
                 'transfer; check the per-account breakdown on Overview.'
             )
 
-        days = (end_date - start_date).days + 1
-        chunks = max(1, math.ceil(days / 89))
-        st.write(f'🔄 Fetching transactions ({start_date} → {end_date}, {chunks} window(s))…')
+        # E*TRADE only serves about two years of transactions. Asking for more
+        # costs one empty round trip per 89-day window and returns nothing.
+        fetch_start, clamped = etrade.clamp_start_date(start_date, end_date)
+        if clamped:
+            st.write(
+                f'ℹ️ E\\*TRADE serves about two years of history — fetching from '
+                f'{fetch_start} rather than {start_date}'
+            )
+
+        accounts = list(active_accounts.itertuples())
+        windows = max(1, math.ceil(((end_date - fetch_start).days + 1) / 89))
+        total_steps = windows * len(accounts)
+        st.write(
+            f'🔄 Fetching transactions ({fetch_start} → {end_date}) — '
+            f'{windows} window(s) × {len(accounts)} account(s)'
+        )
         progress = st.progress(0.0, text='Starting…')
+
         try:
             frames = []
-            accounts = list(active_accounts.itertuples())
             for index, account in enumerate(accounts):
-                progress.progress(
-                    index / len(accounts),
-                    text=f'Account {index + 1} of {len(accounts)}…',
-                )
+                label = getattr(account, 'accountName', None) or account.accountIdKey
+
+                def tick(done, total, _index=index, _label=label):
+                    progress.progress(
+                        min((_index * windows + done) / total_steps, 1.0),
+                        text=f'{_label} — window {done} of {total}',
+                    )
+
                 frames.append(etrade.get_consolidated_transactions(
-                    accounts_obj, account.accountIdKey, start_date, end_date,
-                    account_label=getattr(account, 'accountName', None) or account.accountIdKey,
+                    accounts_obj, account.accountIdKey, fetch_start, end_date,
+                    account_label=label, on_progress=tick,
                 ))
             progress.progress(1.0, text='All accounts fetched')
 
@@ -451,11 +468,15 @@ def _render_sidebar() -> None:
 
     if st.session_state.get('etrade_connected'):
         st.markdown('**Refresh from E\\*TRADE**')
+        # Defaulting to 2000 looked harmless but cost 99 empty round trips per
+        # account: E*TRADE only serves about two years, so everything before that
+        # is a request that can only come back empty.
         start_date = st.date_input(
-            'From', value=datetime.date(2000, 1, 1),
+            'From',
+            value=datetime.date.today() - datetime.timedelta(days=etrade.MAX_HISTORY_DAYS),
             min_value=datetime.date(1990, 1, 1), max_value=datetime.date.today(),
-            help='Reaching back past account opening is what makes the '
-                 'deposit-adjusted return meaningful.',
+            help='E\\*TRADE serves roughly two years of transaction history. '
+                 'Earlier dates are accepted but clamped to that limit.',
         )
         end_date = st.date_input(
             'To', value=datetime.date.today(),

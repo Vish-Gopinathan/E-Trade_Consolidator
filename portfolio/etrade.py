@@ -303,8 +303,53 @@ def portfolio_summary(consolidated_df: pd.DataFrame, cash: float = 0) -> dict:
 
 
 # ── Transactions ──────────────────────────────────────────────────────────────
+#
+# A refresh is dominated by round trips, so the three constants below exist to
+# stop the code asking for things the API cannot give:
+#
+#   * E*TRADE serves roughly two years of transaction history. A request for
+#     2000–2026 is not an error — it is 108 windows per account, 99 of which come
+#     back empty, one HTTP round trip each.
+#   * Each window is capped at 90 days.
+#   * Each response is capped at 50 rows and must be paged with a marker.
 
-def _date_chunks(start_date, end_date, chunk_days=89):
+#: How far back to ask. The docs say "two years"; this account was observed
+#: returning 806 days, so the real cut-off is looser than documented and drifts.
+#:
+#: Deliberately generous at three years. The two errors here are not symmetric:
+#: clamping too tight silently drops transactions the API would have served —
+#: which is the exact class of bug this is meant to prevent — while clamping too
+#: loose costs a handful of empty requests. Four extra round trips is a cheap
+#: insurance premium against losing a deposit from the return calculation.
+MAX_HISTORY_DAYS = 1095
+
+#: API limit on the span of one request.
+_WINDOW_DAYS = 89
+
+#: API limit on rows per response.
+_PAGE_SIZE = 50
+
+#: Runaway guard on the paging loop. 40 pages is 2,000 transactions in one
+#: 89-day window — far past anything real, so hitting it means the marker is not
+#: advancing and we should stop rather than loop forever.
+_MAX_PAGES = 40
+
+
+def clamp_start_date(start_date, end_date):
+    """
+    Pull ``start_date`` forward to the earliest date the API will answer for.
+
+    Returns ``(clamped_start, was_clamped)``. The caller is expected to tell the
+    user when it clamped: silently returning less history than asked for is how
+    someone concludes their older transactions are missing.
+    """
+    earliest = end_date - datetime.timedelta(days=MAX_HISTORY_DAYS)
+    if start_date < earliest:
+        return earliest, True
+    return start_date, False
+
+
+def _date_chunks(start_date, end_date, chunk_days=_WINDOW_DAYS):
     """
     Split a date range into windows the API will accept.
 
@@ -319,8 +364,41 @@ def _date_chunks(start_date, end_date, chunk_days=89):
         current = chunk_end + datetime.timedelta(days=1)
 
 
+def _fetch_window(accounts_obj, account_id_key, start, end) -> list:
+    """
+    Every transaction in one date window, following pagination to the end.
+
+    ``list_transactions`` returns at most 50 rows and signals more with a marker.
+    The previous version took the first page and discarded the rest, so any busy
+    quarter silently lost transactions — and a missing trade does not announce
+    itself, it just makes the numbers slightly wrong.
+    """
+    collected, marker, seen_markers = [], None, set()
+
+    for _ in range(_MAX_PAGES):
+        response = accounts_obj.list_transactions(
+            account_id_key, start, end,
+            marker=marker, count=_PAGE_SIZE, resp_format='json',
+        )
+        body = response.get('TransactionListResponse') or {}
+        page = body.get('Transaction') or []
+        if isinstance(page, dict):      # a single transaction comes back unwrapped
+            page = [page]
+        collected.extend(page)
+
+        marker = body.get('marker')
+        more = str(body.get('moreTransactions', '')).lower() in ('true', '1')
+        # Stop unless there is genuinely another page *and* the marker moved —
+        # a repeated marker would otherwise re-fetch the same page forever.
+        if not more or not marker or marker in seen_markers:
+            break
+        seen_markers.add(marker)
+
+    return collected
+
+
 def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_date,
-                                  account_label=None) -> pd.DataFrame:
+                                  account_label=None, on_progress=None) -> pd.DataFrame:
     """
     Fetch and classify one account's transactions over any date range.
 
@@ -336,29 +414,36 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
     :func:`get_all_consolidated_transactions`, which runs the second pass, rather
     than calling this directly.
 
+    ``start_date`` is clamped to :data:`MAX_HISTORY_DAYS`; asking for more only
+    buys empty round trips.
+
     Args:
         account_label: Human-readable account name for the ``Account`` column.
             Defaults to the account id key.
+        on_progress: Called as ``(done_windows, total_windows)`` after each
+            window, so a long fetch can show progress that actually moves.
     """
     if not isinstance(start_date, datetime.date):
         raise TypeError('start_date must be a datetime.date')
     if not isinstance(end_date, datetime.date):
         raise TypeError('end_date must be a datetime.date')
 
+    start_date, _ = clamp_start_date(start_date, end_date)
+    windows = list(_date_chunks(start_date, end_date))
+
     raw_transactions = []
-    for chunk_start, chunk_end in _date_chunks(start_date, end_date):
+    for index, (chunk_start, chunk_end) in enumerate(windows, start=1):
         try:
-            response = accounts_obj.list_transactions(
-                account_id_key, chunk_start, chunk_end, resp_format='json'
+            raw_transactions.extend(
+                _fetch_window(accounts_obj, account_id_key, chunk_start, chunk_end)
             )
-            chunk = response.get('TransactionListResponse', {}).get('Transaction', [])
-            if chunk:
-                raw_transactions.extend(chunk)
         except Exception as exc:
             LOGGER.warning(
                 'transaction fetch failed for %s %s–%s: %s',
                 account_id_key, chunk_start, chunk_end, exc,
             )
+        if on_progress:
+            on_progress(index, len(windows))
 
     if not raw_transactions:
         return pd.DataFrame()
@@ -399,38 +484,68 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
     return pd.DataFrame(rows).sort_values('Date', ascending=False).reset_index(drop=True)
 
 
+def _brokerage_fields(source: dict) -> dict:
+    """
+    Pull quantity, price and symbol out of a ``brokerage`` block.
+
+    The transaction list and the transaction detail response use the same shape,
+    differing only in capitalisation, so one reader serves both.
+    """
+    brokerage = source.get('brokerage') or source.get('Brokerage') or {}
+    product = brokerage.get('product') or brokerage.get('Product') or {}
+
+    quantity, price = brokerage.get('quantity'), brokerage.get('price')
+    try:
+        quantity = float(quantity) if quantity is not None else None
+        price = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        quantity = price = None
+
+    return {
+        'Symbol': product.get('symbol') or '',
+        'Quantity': quantity,
+        'Price': price,
+    }
+
+
 def _trade_detail(accounts_obj, account_id_key, transaction, amount) -> dict:
     """
-    Fetch quantity, price and symbol for one trade.
+    Quantity, price and symbol for one trade.
 
-    Requires a second API call per trade — the transaction list itself carries
-    only the dollar amount. A failure here degrades to the amount alone rather
-    than losing the row.
+    **The list response usually already has these.** Each transaction row carries
+    a ``brokerage`` block with quantity, price and product symbol, so the separate
+    ``list_transaction_details`` call the old code made for *every* trade was
+    almost always redundant — 215 extra sequential round trips on this account,
+    the single largest cost of a refresh.
+
+    The detail call remains as a fallback for rows where the list omits those
+    fields. A failure there degrades to the dollar amount rather than losing the
+    row.
     """
-    try:
-        response = accounts_obj.list_transaction_details(
-            account_id_key, transaction['transactionId'], resp_format='json'
-        )
-        details = response.get('TransactionDetailsResponse', {}).get('Brokerage', {}) or {}
-    except Exception as exc:
-        LOGGER.debug('transaction detail failed for %s: %s', transaction.get('transactionId'), exc)
-        details = {}
+    fields = _brokerage_fields(transaction)
 
-    product = details.get('Product') or details.get('product') or {}
-    symbol = product.get('symbol', '')
-    if not symbol:
-        symbol = ((transaction.get('brokerage') or {}).get('product') or {}).get('symbol', '')
-
-    quantity, price = details.get('quantity'), details.get('price')
-    total_value = amount
-    if quantity is not None and price is not None:
+    if fields['Quantity'] is None or fields['Price'] is None:
         try:
-            quantity, price = float(quantity), float(price)
-            total_value = quantity * price
-        except (TypeError, ValueError):
-            quantity = price = None
+            response = accounts_obj.list_transaction_details(
+                account_id_key, transaction['transactionId'], resp_format='json'
+            )
+            detail = response.get('TransactionDetailsResponse') or {}
+            fallback = _brokerage_fields(detail)
+            # Fill only what is genuinely absent — a quantity of 0.0 is falsy but
+            # is still an answer, and must not be replaced.
+            fields = {
+                key: fallback[key] if value in (None, '') else value
+                for key, value in fields.items()
+            }
+        except Exception as exc:
+            LOGGER.debug(
+                'transaction detail failed for %s: %s',
+                transaction.get('transactionId'), exc,
+            )
 
-    return {'Symbol': symbol, 'Quantity': quantity, 'Price': price, 'Total Value': total_value}
+    quantity, price = fields['Quantity'], fields['Price']
+    total_value = quantity * price if quantity is not None and price is not None else amount
+    return {**fields, 'Total Value': total_value}
 
 
 def get_all_consolidated_transactions(accounts_obj, active_accounts, start_date, end_date,

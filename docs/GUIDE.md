@@ -67,11 +67,13 @@ Log in, open **E\*TRADE Connection** in the sidebar, press **Get authorization
 URL**, authorize in the browser tab that opens, paste the verifier code back, then
 press **Refresh data**.
 
-The default date range starts at 2000-01-01. That is deliberate: reaching back
-past account opening is what makes the deposit-adjusted return meaningful (see
-[below](#deposit-adjusted-return)). E\*TRADE limits each request to 90 days, so
-long ranges are split into 89-day windows automatically — a full history takes a
-minute or two.
+The default date range goes back three years, which is as far as E\*TRADE will
+answer. It documents a two-year limit but has been observed returning more, so the
+app asks for three and clamps anything earlier — and says so when it does, rather
+than silently returning less than you asked for.
+
+A refresh takes roughly ten seconds. If it takes minutes, see
+[Troubleshooting](#troubleshooting).
 
 **Demo** — `streamlit run demo.py`
 
@@ -355,9 +357,21 @@ The report key is missing from the contract. Run `pytest tests/test_schema.py` �
 it fails on exactly this.
 
 **Transaction fetch is slow.**
-Expected. Each trade needs a second API call for quantity and price, and long
-ranges are split into 89-day windows. A decade of history across two accounts
-takes a couple of minutes.
+A refresh should be about ten seconds for two accounts. Minutes means one of the
+three things that used to make it slow has come back:
+
+1. **Asking for more history than exists.** Every 89-day window is one round trip
+   whether or not it holds anything, so a 2000–2026 request was 108 windows per
+   account, 99 of them necessarily empty. `clamp_start_date` caps the request at
+   `MAX_HISTORY_DAYS`.
+2. **A detail call per trade.** The transaction list already carries a
+   `brokerage` block with quantity, price and symbol; fetching each trade's
+   detail anyway added one round trip per trade — 215 on a real account. The
+   detail call is now only a fallback for rows the list leaves incomplete.
+3. **Paging.** Each response holds at most 50 rows, so busy windows need several
+   requests. This one is unavoidable, and skipping it loses transactions.
+
+Together those took a refresh from 431 requests to 26.
 
 ---
 

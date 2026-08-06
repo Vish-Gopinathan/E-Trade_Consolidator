@@ -77,9 +77,18 @@ massaging the formula would have hidden a real failure mode.
   cash read as $0 — the residual went negative and was clamped.
 - Cash is `Computed.netCash`. Never derive it by subtraction.
 - `list_transactions` rejects ranges over 90 days. `_date_chunks` splits into
-  89-day windows.
-- Each trade needs a second call for quantity and price. That is why long fetches
-  are slow; it is not a bug to optimise away without changing what is fetched.
+  89-day windows. **Every window is a round trip whether or not it holds
+  anything**, so the requested range is clamped to `MAX_HISTORY_DAYS` — asking for
+  2000–2026 was 108 windows per account, 99 necessarily empty.
+- `MAX_HISTORY_DAYS` is deliberately generous (3 years) against a documented
+  2-year limit, because this account returned 806 days. Clamping too tight
+  silently drops transactions; clamping too loose costs a few empty requests.
+- **`list_transactions` returns at most 50 rows and must be paged** via `marker` /
+  `moreTransactions`. Not paging silently truncates busy quarters — the numbers
+  just come out slightly wrong, with nothing to indicate it.
+- The list response already carries a `brokerage` block with quantity, price and
+  `product.symbol`. `list_transaction_details` is a **fallback**, not the primary
+  source; calling it per trade added 215 round trips on a real account.
 - Sells come back with negative quantity.
 
 ### yfinance (`portfolio/storage/earnings.py`, `prices.py`, `portfolio/market.py`)
@@ -136,7 +145,7 @@ largest holding.
 ## Working here
 
 ```bash
-pytest                          # 58 tests, ~4s
+pytest                          # 70 tests, ~4s
 streamlit run demo.py           # exercise the UI without real credentials
 python cli.py --help
 ```
