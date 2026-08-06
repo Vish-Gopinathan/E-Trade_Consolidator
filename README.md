@@ -53,6 +53,13 @@ python cli.py --start 2024-01-01 --output-dir outputs/
 
 ---
 
+## Deployed on Streamlit Cloud?
+
+Set **Main file path** to `app.py` in the app's settings. It used to be
+`new work/app.py`; Cloud keeps that path in its own settings rather than the repo,
+so an older deployment silently keeps serving the previous build. Details and the
+cold-start caveats are in [docs/GUIDE.md](docs/GUIDE.md#deploying-to-streamlit-cloud).
+
 ## Documentation
 
 - **[docs/GUIDE.md](docs/GUIDE.md)** — setup, every page, how money is classified,

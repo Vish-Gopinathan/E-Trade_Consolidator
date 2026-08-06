@@ -6,6 +6,7 @@
 - [How money is classified](#how-money-is-classified)
 - [What each metric means](#what-each-metric-means)
 - [Data storage and privacy](#data-storage-and-privacy)
+- [Deploying to Streamlit Cloud](#deploying-to-streamlit-cloud)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
 - [Developing](#developing)
@@ -323,6 +324,67 @@ Other notes:
 
 ---
 
+## Deploying to Streamlit Cloud
+
+### The entry point moved
+
+The restructure replaced `new work/app.py` with `app.py` at the repository root.
+**Streamlit Cloud stores the main file path in its own settings, not in the
+repo**, so a deployment created before that still points at a file that no longer
+exists. It does not fall back — it keeps serving the last build that worked, which
+means you are testing old code while the repo has new code.
+
+Fix it in the app's settings: *Manage app → Settings → Main file path* → `app.py`,
+then reboot. Nothing in the repository can do this for you.
+
+### Secrets
+
+Cloud has no `.env`. Put the same keys in *Settings → Secrets*:
+
+```toml
+CONSUMER_KEY = "..."
+CONSUMER_SECRET = "..."
+APP_PASSWORD_HASH = "..."
+```
+
+### Cold starts refetch everything
+
+Cloud gives every container a fresh filesystem, and `data/` is gitignored. So on
+each restart — and Cloud restarts apps that go idle — the app starts with **no
+cache at all**:
+
+| Missing | Consequence |
+|---|---|
+| `portfolio_cache.json` | Opens with no data; needs an E\*TRADE refresh |
+| `earnings_store.json` | Earnings refetches every symbol (seconds) |
+| `price_store.json` | Value Over Time rebuilds all daily prices (slower) |
+| `month_end_snapshot.json` | Guests see nothing |
+
+This is the deliberate cost of not writing portfolio data to the repository, which
+is public. The replacement is manual: **Save as snapshot → Export snapshot file**
+while the container is warm, then **Restore** after a restart. Keep that file
+somewhere you control.
+
+If you would rather not do that dance, run the app locally — `data/` persists
+there and cold starts are instant.
+
+### Round trips cost more from Cloud
+
+Every E\*TRADE call goes from Streamlit's data centre rather than your machine, so
+per-request latency is higher and request count matters more. A refresh is about
+26 requests; if it is taking minutes, the deployment is running pre-fix code — see
+the entry point above.
+
+### Before you expose this publicly
+
+A Cloud app is reachable by anyone with the URL. The password gate is a speed bump
+— its lockout resets on reload — so it is not adequate on its own for a page that
+displays your holdings and cost basis. Use *Settings → Sharing* to restrict
+viewers to your own account, or keep the app private and run it locally. See
+[Security](#security).
+
+---
+
 ## Troubleshooting
 
 **Cash shows $0.**
@@ -357,6 +419,13 @@ The report key is missing from the contract. Run `pytest tests/test_schema.py` �
 it fails on exactly this.
 
 **Transaction fetch is slow.**
+First check *what code is actually running*. Streamlit reloads page files but not
+the modules they import, so a server started before a change is still serving the
+old code — restart it. On Streamlit Cloud, check the main file path is `app.py`
+(see [Deploying](#deploying-to-streamlit-cloud)); a stale path keeps the previous
+build alive.
+
+The refresh prints per-phase timings, so the panel tells you which step is slow.
 A refresh should be about ten seconds for two accounts. Minutes means one of the
 three things that used to make it slow has come back:
 
