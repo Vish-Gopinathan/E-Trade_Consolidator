@@ -11,7 +11,7 @@ the flag's name. NVDA's 2024-06-05 close comes back as $122.44, not the $1,224 i
 actually traded at before the 10:1 split.
 
 Both halves of that matter. Split-adjusted prices have to be paired with
-split-adjusted share counts, which is why lib/portfolio_history.py scales
+split-adjusted share counts, which is why portfolio/history.py scales
 historical trade quantities to today's share basis. Leaving dividends
 unadjusted is what we want: a dividend was paid out as cash and is picked up by
 the cash reconstruction, so adjusting the price for it too would count it twice.

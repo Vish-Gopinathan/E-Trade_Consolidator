@@ -1,7 +1,7 @@
 """
 Market data helpers used by other pages.
 
-Earnings data is now handled by lib/earnings_store.py.
+Earnings data is handled by portfolio/storage/earnings.py.
 """
 
 import streamlit as st
