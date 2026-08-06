@@ -1,216 +1,191 @@
+"""
+Earnings: the next report date for each holding, and how recent ones landed.
+
+Data is cached in ``data/earnings_store.json``. Past quarters never change, so
+they are fetched once; only upcoming dates are re-checked, weekly.
+
+The Reported column is labelled honestly. yfinance's EPS history is indexed by
+fiscal **quarter end**, not the announcement date, and the two can be a month
+apart. Where the real announcement date is available the column shows it; where
+it is not, the quarter end is shown and marked, and the one-day price reaction is
+left blank rather than measured against the wrong day.
+"""
+
 from datetime import date
 
 import pandas as pd
 import streamlit as st
-from ui.common import require_auth, render_sidebar_status, is_guest
-from portfolio.storage import earnings as es
 
-st.set_page_config(page_title='Earnings', page_icon='📅', layout='wide')
-require_auth()
+from portfolio.storage import earnings as earnings_store
+from ui import theme
+from ui.common import is_guest, page_header, require_portfolio
 
-with st.sidebar:
-    st.title('📈 Portfolio')
-    render_sidebar_status()
+page_header('Earnings', '📅')
 
-st.title('📅 Earnings Calendar')
+holdings = require_portfolio('holdings')
+colours = theme.palette()
+symbols = sorted(holdings[holdings['Symbol'] != 'CASH']['Symbol'].dropna().unique().tolist())
+today = date.today()
 
-portfolio = st.session_state.get('portfolio')
-if not portfolio:
-    st.warning('No data loaded. Go to the home page and refresh.')
-    st.stop()
-
-holdings_df = portfolio.get('holdings')
-if holdings_df is None or (hasattr(holdings_df, 'empty') and holdings_df.empty):
-    st.info('No holdings data available.')
-    st.stop()
-
-all_symbols = sorted(
-    holdings_df[holdings_df['Symbol'] != 'CASH']['Symbol'].unique().tolist()
-)
-
-# ── Load store ────────────────────────────────────────────────────────────────
+# ── Load, fetching what is missing or stale ───────────────────────────────────
 
 if 'earnings_store' not in st.session_state:
-    with st.spinner('Loading earnings data…'):
-        store = es.load()
+    st.session_state.earnings_store = earnings_store.load()
+store = st.session_state.earnings_store
+
+outdated = earnings_store.stale_symbols(symbols, store)
+if outdated:
+    progress = st.progress(0.0, text=f'Fetching earnings for {len(outdated)} symbol(s)…')
+    store, _ = earnings_store.refresh(
+        outdated, store,
+        on_progress=lambda done, total, symbol: progress.progress(
+            done / total, text=f'{symbol} — {done} of {total}'),
+    )
+    progress.empty()
     st.session_state.earnings_store = store
-else:
-    store = st.session_state.earnings_store
 
-# Auto-fetch symbols that are missing or stale (first visit / new holdings)
-today = date.today()
-need_fetch = [
-    s for s in all_symbols
-    if s not in store
-    or (today - date.fromisoformat(store[s].get('last_updated', '2000-01-01'))).days >= 7
-]
-
-if need_fetch:
-    with st.spinner(
-        f'Fetching earnings for {len(need_fetch)} symbol(s): {", ".join(need_fetch)} '
-        f'— this takes ~{len(need_fetch) * 2}s on first run…'
-    ):
-        store, _ = es.refresh(need_fetch, store, force=True)
-        es.save(store)
-        st.session_state.earnings_store = store
-
-# ── Header controls ───────────────────────────────────────────────────────────
-
-hdr_left, hdr_right = st.columns([4, 1])
-
-last_updates = [
+header_left, header_right = st.columns([4, 1])
+updates = [
     date.fromisoformat(store[s]['last_updated'])
-    for s in all_symbols if s in store
+    for s in symbols if s in store and store[s].get('last_updated')
 ]
-if last_updates:
-    with hdr_left:
+with header_left:
+    if updates:
         st.caption(
-            f'Data last refreshed: **{min(last_updates).strftime("%b %d, %Y")}** '
-            '· refreshed automatically when > 7 days old'
+            f'Last refreshed {min(updates):%b %d, %Y} · upcoming dates re-checked weekly, '
+            'past quarters kept permanently'
         )
+with header_right:
+    if not is_guest() and st.button('🔄 Refresh all', use_container_width=True):
+        progress = st.progress(0.0, text='Refreshing…')
+        store, _ = earnings_store.refresh(
+            symbols, store, force=True,
+            on_progress=lambda done, total, symbol: progress.progress(
+                done / total, text=f'{symbol} — {done} of {total}'),
+        )
+        st.session_state.earnings_store = store
+        st.rerun()
 
-if not is_guest():
-    with hdr_right:
-        if st.button('🔄 Refresh All'):
-            with st.spinner(f'Refreshing {len(all_symbols)} symbols…'):
-                store, _ = es.refresh(all_symbols, store, force=True)
-                es.save(store)
-                st.session_state.earnings_store = store
-            st.rerun()
+# ── Upcoming ──────────────────────────────────────────────────────────────────
 
-# ── Upcoming Earnings ─────────────────────────────────────────────────────────
+st.subheader('Upcoming')
 
-st.subheader('Upcoming Earnings')
-st.caption('Dates are company estimates — verify with your broker before trading.')
-
-upcoming_rows = []
-for sym in all_symbols:
-    data = store.get(sym) or {}
-    u = data.get('upcoming')
-    if not u:
+upcoming = []
+for symbol in symbols:
+    entry = (store.get(symbol) or {}).get('upcoming')
+    if not entry:
         continue
     try:
-        dt = date.fromisoformat(u['date'])
-    except Exception:
+        when = date.fromisoformat(entry['date'])
+    except (KeyError, ValueError):
         continue
-    days = (dt - today).days
-    if days < -3:   # skip if more than 3 days in the past (estimate lag)
+    days_away = (when - today).days
+    if days_away < -3:   # estimates lag; drop anything clearly stale
         continue
-    upcoming_rows.append({
-        'Symbol': sym,
-        'Date': dt,
-        'Days Away': days,
-        'EPS Estimate': u.get('eps_estimate'),
+    upcoming.append({
+        'Symbol': symbol, 'Expected': when, 'Days away': days_away,
+        'EPS estimate': entry.get('eps_estimate'),
     })
 
-if upcoming_rows:
-    up_df = pd.DataFrame(upcoming_rows).sort_values('Days Away')
+if upcoming:
+    frame = pd.DataFrame(upcoming).sort_values('Days away')
 
-    def _up_row_style(row):
-        d = row['Days Away']
-        if d <= 7:
-            return ['background-color: rgba(220,50,50,0.15)'] * len(row)
-        if d <= 30:
-            return ['background-color: rgba(255,200,0,0.12)'] * len(row)
-        return [''] * len(row)
+    def _proximity(row):
+        """Tint the row by how soon it is. The Days away column carries it too."""
+        if row['Days away'] <= 7:
+            tint = 'rgba(227,73,72,0.16)'
+        elif row['Days away'] <= 30:
+            tint = 'rgba(237,161,0,0.13)'
+        else:
+            tint = ''
+        return [f'background-color: {tint}' if tint else ''] * len(row)
 
-    fmt_up = {
-        'Date': lambda d: d.strftime('%b %d, %Y'),
-        'EPS Estimate': lambda v: f'${v:.2f}' if v is not None and pd.notna(v) else '—',
-    }
     st.dataframe(
-        up_df.style.apply(_up_row_style, axis=1).format(fmt_up, na_rep='—'),
-        use_container_width=True,
-        hide_index=True,
+        frame.style.apply(_proximity, axis=1).format({
+            'Expected': '{:%b %d, %Y}', 'EPS estimate': '${:,.2f}', 'Days away': '{:,.0f}',
+        }, na_rep='—'),
+        use_container_width=True, hide_index=True,
     )
+    st.caption('Company estimates — confirm with your broker before trading around a date.')
 else:
-    st.info('No upcoming earnings found for current holdings.')
-
-# ── Recent Earnings History ────────────────────────────────────────────────────
+    st.info('No upcoming earnings dates found for these holdings.')
 
 st.markdown('---')
-st.subheader('Recent Earnings History')
 
-recent_rows = []
-for sym in all_symbols:
-    data = store.get(sym) or {}
-    for r in data.get('recent', []):
+# ── History ───────────────────────────────────────────────────────────────────
+
+st.subheader('Recent results')
+
+rows = []
+for symbol in symbols:
+    for quarter in (store.get(symbol) or {}).get('recent', []):
         try:
-            dt = date.fromisoformat(r['date'])
-        except Exception:
+            when = date.fromisoformat(quarter['date'])
+        except (KeyError, ValueError):
             continue
-        eps_act = r.get('eps_actual')
-        eps_est = r.get('eps_estimate')
-        surprise = r.get('surprise_pct')
-        price_chg = r.get('price_chg_pct')
+        actual, estimate = quarter.get('eps_actual'), quarter.get('eps_estimate')
+        surprise = quarter.get('surprise_pct')
 
         if surprise is not None:
-            beat = '✅ Beat' if surprise >= 0 else '❌ Miss'
-        elif eps_act is not None and eps_est is not None:
-            beat = '✅ Beat' if eps_act >= eps_est else '❌ Miss'
+            verdict = '✅ Beat' if surprise >= 0 else '❌ Miss'
+        elif actual is not None and estimate is not None:
+            verdict = '✅ Beat' if actual >= estimate else '❌ Miss'
         else:
-            beat = '—'
+            verdict = '—'
 
-        recent_rows.append({
-            'Symbol': sym,
-            'Date': dt,
-            'Actual EPS': eps_act,
-            'Est EPS': eps_est,
+        rows.append({
+            'Symbol': symbol,
+            'Reported': when,
+            'Exact date': bool(quarter.get('date_is_report_date')),
+            'EPS': actual,
+            'Estimate': estimate,
             'Surprise %': surprise,
-            'Beat/Miss': beat,
-            'Stock Reaction': price_chg,
+            'Result': verdict,
+            'Next-day move': quarter.get('price_chg_pct'),
         })
 
-if recent_rows:
-    rec_df = pd.DataFrame(recent_rows).sort_values('Date', ascending=False)
+if rows:
+    frame = pd.DataFrame(rows).sort_values('Reported', ascending=False)
+    approximate = int((~frame['Exact date']).sum())
+    frame = frame.drop(columns='Exact date')
 
-    def _color_signed(val):
-        if val is None or pd.isna(val):
+    def _signed_ink(value):
+        if value is None or pd.isna(value):
             return ''
-        return 'color: #27ae60' if val >= 0 else 'color: #c0392b'
+        return f'color: {colours["positive"] if value >= 0 else colours["negative"]}'
 
-    fmt_rec = {
-        'Date': lambda d: d.strftime('%b %d, %Y'),
-        'Actual EPS': lambda v: f'${v:.2f}' if v is not None and pd.notna(v) else '—',
-        'Est EPS': lambda v: f'${v:.2f}' if v is not None and pd.notna(v) else '—',
-        'Surprise %': lambda v: f'{v:+.1f}%' if v is not None and pd.notna(v) else '—',
-        'Stock Reaction': lambda v: f'{v:+.2f}%' if v is not None and pd.notna(v) else '—',
-    }
-    styled = (
-        rec_df.style
-        .format(fmt_rec, na_rep='—')
-        .map(_color_signed, subset=['Surprise %'])
-        .map(_color_signed, subset=['Stock Reaction'])
+    st.dataframe(
+        frame.style
+        .map(_signed_ink, subset=['Surprise %', 'Next-day move'])
+        .format({
+            'Reported': '{:%b %d, %Y}', 'EPS': '${:,.2f}', 'Estimate': '${:,.2f}',
+            'Surprise %': '{:+.1f}%', 'Next-day move': '{:+.2f}%',
+        }, na_rep='—'),
+        use_container_width=True, hide_index=True,
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    if approximate:
+        st.caption(
+            f'{approximate} row(s) show the fiscal quarter end rather than the '
+            'announcement date, which is all the data source offered for them. '
+            'Next-day move is left blank there rather than measured against the wrong day.'
+        )
 else:
-    st.info('No recent earnings history in store yet.')
+    st.info('No earnings history yet. Use **Refresh all** if this persists.')
 
-# ── Coverage summary ──────────────────────────────────────────────────────────
+# ── Coverage ──────────────────────────────────────────────────────────────────
 
 no_data = [
-    s for s in all_symbols
-    if not (store.get(s) or {}).get('recent')
-    and not (store.get(s) or {}).get('upcoming')
+    s for s in symbols
+    if not (store.get(s) or {}).get('recent') and not (store.get(s) or {}).get('upcoming')
 ]
 if no_data:
     st.caption(
-        f'No earnings data found for: {", ".join(no_data)} '
-        '— may be ETFs, funds, or recently listed.'
+        f'No earnings for {", ".join(no_data)} — ETFs, trusts and funds do not report '
+        'earnings, so this is expected for those.'
     )
 
-# ── Debug expander ────────────────────────────────────────────────────────────
-
-with st.expander('🔍 Debug — click to inspect store and errors'):
-    errors = {s: store[s].get('_error') for s in all_symbols if store.get(s) and store[s].get('_error')}
-    if errors:
-        st.markdown('**Fetch errors:**')
-        for sym, err in errors.items():
-            st.code(f'{sym}: {err}')
-    else:
-        st.caption('No errors recorded.')
-
-    st.markdown('**Store snapshot (first 3 symbols):**')
-    for sym in all_symbols[:3]:
-        entry = store.get(sym, 'NOT IN STORE')
-        st.write(f'**{sym}**:', entry)
+errors = {s: store[s]['_error'] for s in symbols if (store.get(s) or {}).get('_error')}
+if errors:
+    with st.expander(f'⚠️ {len(errors)} symbol(s) had fetch errors'):
+        for symbol, message in errors.items():
+            st.code(f'{symbol}: {message}')

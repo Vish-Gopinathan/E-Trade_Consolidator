@@ -1,12 +1,23 @@
 """
-Demo portfolio: Warren Buffett's Berkshire Hathaway, scaled to personal size.
-All holdings, transactions, and theses are fictional and for demonstration only.
-News and earnings data are live from yfinance.
+Demo portfolio: a Berkshire-shaped book scaled to personal size.
+
+Holdings, transactions and theses are fictional. Prices, splits and earnings come
+from live market data, so the charts move like the real thing.
+
+The analytics report is produced by the **real engine**
+(:class:`portfolio.analytics.PortfolioAnalytics`), not by hand-written fixtures.
+An earlier version built its own report with its own key names, which is how the
+pages came to be written against keys the engine never emitted: the demo looked
+correct while the live dashboard rendered em dashes. Demo data now differs from
+live data only in where the numbers come from.
 """
 
 import datetime
+
 import pandas as pd
 import streamlit as st
+
+from portfolio import analytics, classify
 
 # ── Holdings config ────────────────────────────────────────────────────────────
 # (symbol, description, shares, avg_cost, sector, date_acquired)
@@ -268,10 +279,16 @@ def _row(date_str, sym, desc, txn_type, category, qty, price, value):
 def _build_transactions() -> pd.DataFrame:
     rows = []
 
-    # Deposits
+    # Deposits.
+    #
+    # These must roughly fund the holdings: total deposits ≈ cost basis (~$225k)
+    # plus the cash balance (~$285k). They previously summed to $1.33M against a
+    # $705k portfolio, which is not a demo of anything — deposit-adjusted return
+    # correctly reported -76%, because on those numbers the account really had
+    # lost most of the money put into it.
     for d, amt in [
-        ('2010-01-15', 250_000), ('2012-03-20', 150_000), ('2015-06-10', 200_000),
-        ('2018-01-08', 300_000), ('2020-04-02', 250_000), ('2022-01-20', 175_000),
+        ('2010-01-15', 95_000), ('2012-03-20', 55_000), ('2015-06-10', 75_000),
+        ('2018-01-08', 115_000), ('2020-04-02', 95_000), ('2022-01-20', 65_000),
     ]:
         rows.append(_row(d, '', 'BROKERAGE DEPOSIT', 'Deposit', 'Deposit', None, None, float(amt)))
 
@@ -312,61 +329,13 @@ def _build_transactions() -> pd.DataFrame:
     return df
 
 
-def _build_analytics(holdings_df: pd.DataFrame, txns_df: pd.DataFrame) -> dict:
-    stocks = holdings_df[holdings_df['Symbol'] != 'CASH']
-    total_val = float(stocks['Market Value'].sum())
-    total_cost = float(stocks['Total Cost'].sum())
-
-    weights = (stocks.set_index('Symbol')['Market Value'] / total_val * 100).sort_values(ascending=False)
-
-    sector_map = {sym: sector for sym, _, _, _, sector, _ in _HOLDINGS}
-    sector_weights: dict = {}
-    for sym in stocks['Symbol']:
-        val = float(stocks.loc[stocks['Symbol'] == sym, 'Market Value'].values[0])
-        sec = sector_map.get(sym, 'Other')
-        sector_weights[sec] = sector_weights.get(sec, 0.0) + val
-    sector_pct = {k: round(v / total_val * 100, 2) for k, v in sector_weights.items()}
-
-    gains = stocks.set_index('Symbol')['Total Gain %'].dropna()
-    win_rate = float((gains > 0).mean() * 100) if len(gains) else 0
-    best = str(gains.idxmax()) if len(gains) else '—'
-    worst = str(gains.idxmin()) if len(gains) else '—'
-
-    income = float(txns_df[txns_df['Category'] == 'Income']['Total Value'].sum())
-    simple_return = (total_val - total_cost) / total_cost * 100 if total_cost else 0
-
-    return {
-        'Performance Metrics': {
-            'Modified Dietz Return (%)': 18.4,
-            'Simple Return (%)': round(simple_return, 2),
-        },
-        'Concentration Analysis': {
-            'HHI Score': round(float((weights ** 2).sum()), 1),
-            'Top 3 Concentration (%)': round(float(weights.head(3).sum()), 1),
-            'Top 5 Concentration (%)': round(float(weights.head(5).sum()), 1),
-            'Top 10 Concentration (%)': round(float(weights.head(10).sum()), 1),
-            'Number of Holdings': len(stocks),
-            'Top 5 Holdings': [
-                {'Symbol': sym, 'Weight (%)': round(w, 2)}
-                for sym, w in weights.head(5).items()
-            ],
-        },
-        'Risk Metrics': {
-            'Sharpe Ratio': 1.42,
-            'Sortino Ratio': 1.89,
-            'Win Rate (%)': round(win_rate, 1),
-            'Best Performer': best,
-            'Worst Performer': worst,
-            'Portfolio Volatility (%)': 11.8,
-        },
-        'Sector Analysis': {
-            'Sector Weights (%)': sector_pct,
-        },
-        'Income Summary': {
-            'Total Income': round(income, 2),
-            'Number of Income Transactions': int((txns_df['Category'] == 'Income').sum()),
-        },
-    }
+def _classified(txns_df: pd.DataFrame) -> pd.DataFrame:
+    """Run demo transactions through the same classification the live app uses."""
+    frame = txns_df.copy()
+    frame['Ref ID'] = frame['Security Name'].map(classify.parse_ref_id)
+    frame['Counterparty'] = frame['Security Name'].map(classify.parse_counterparty)
+    frame['Account'] = 'Demo Brokerage'
+    return classify.reconcile_transfers(frame)
 
 
 # ── Main public builder ────────────────────────────────────────────────────────
@@ -419,20 +388,17 @@ def build_demo_portfolio() -> dict:
     }])
     holdings_df = pd.concat([holdings_df, cash_row], ignore_index=True)
 
-    txns_df = _build_transactions()
-    cash_flows_df = txns_df[txns_df['Category'].isin(['Deposit', 'Withdrawal'])][
-        ['Date', 'Total Value', 'Security Name', 'Transaction Type']
-    ].rename(columns={'Total Value': 'Amount', 'Security Name': 'Description', 'Transaction Type': 'Type'}).copy()
-
-    income_df = txns_df[txns_df['Category'] == 'Income'][
-        ['Date', 'Security Name', 'Total Value', 'Transaction Type']
-    ].rename(columns={'Security Name': 'Description'}).copy()
+    txns_df = _classified(_build_transactions())
+    cash_flows_df = classify.get_cash_flows(txns_df)
+    income_df = classify.get_income(txns_df)
 
     stocks_only = holdings_df[holdings_df['Symbol'] != 'CASH']
     total_cost_basis = float(stocks_only['Total Cost'].sum())
     total_gain = float(stocks_only['Total Gain'].sum())
 
-    analytics_report = _build_analytics(holdings_df, txns_df)
+    analytics_report = analytics.PortfolioAnalytics(
+        holdings_df, txns_df, cash_flows_df,
+    ).generate_full_report()
 
     summary = {
         'Total Stocks': len(stocks_only),

@@ -1,134 +1,243 @@
-import streamlit as st
-import plotly.express as px
+"""
+Cash Flows & Income, plus the Transfer Review that decides what counts as which.
+
+The three tabs answer three different questions:
+
+* **Cash flows** — how much money you put in and took out.
+* **Income** — what the portfolio paid you while you held it.
+* **Transfer review** — the transfers the app could not classify on its own, and
+  what tagging each one would change.
+
+The review tab exists because the alternative is guessing. A transfer to an
+account the app has never seen is counted as external, which is the safe default,
+but only the account holder knows whether that account is theirs.
+"""
+
 import pandas as pd
-from ui.common import require_auth, render_sidebar_status
+import plotly.express as px
+import streamlit as st
 
-st.set_page_config(page_title='Cash Flows & Income', page_icon='💵', layout='wide')
-require_auth()
+from portfolio import classify, schema
+from portfolio.storage import accounts as account_map_store
+from ui import theme
+from ui.common import is_guest, money, page_header, require_portfolio, signed_money
 
-with st.sidebar:
-    st.title('📈 Portfolio')
-    render_sidebar_status()
+page_header('Cash Flows & Income', '💵')
 
-st.title('💵 Cash Flows & Income')
+portfolio = require_portfolio()
+colours = theme.palette()
+report = portfolio.get('analytics_report') or {}
+transactions = portfolio.get('transactions')
+cash_flows = portfolio.get('cash_flows')
 
-portfolio = st.session_state.get('portfolio')
-if not portfolio:
-    st.warning('No data loaded. Go to the home page and refresh.')
-    st.stop()
+needs_review = 0
+if transactions is not None and not transactions.empty and 'Needs Review' in transactions.columns:
+    needs_review = int(transactions['Needs Review'].fillna(False).sum())
 
-cash_tab, income_tab = st.tabs(['Cash Flows', 'Income'])
+flows_tab, income_tab, review_tab = st.tabs([
+    'Cash Flows', 'Income',
+    f'Transfer Review{f" ({needs_review})" if needs_review else ""}',
+])
 
-# ── Cash Flows tab ────────────────────────────────────────────────────────────
-with cash_tab:
-    cf = portfolio.get('cash_flows')
-    if cf is None or (hasattr(cf, 'empty') and cf.empty):
-        st.info('No cash flow data available.')
+# ── Cash flows ────────────────────────────────────────────────────────────────
+
+with flows_tab:
+    if cash_flows is None or cash_flows.empty:
+        st.info('No deposits or withdrawals in the loaded date range.')
     else:
-        df = cf.copy()
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        if 'Total Value' in df.columns:
-            df['Total Value'] = pd.to_numeric(df['Total Value'], errors='coerce').fillna(0)
+        frame = cash_flows.copy()
+        frame['Date'] = pd.to_datetime(frame['Date'], errors='coerce')
+        frame['Total Value'] = pd.to_numeric(frame['Total Value'], errors='coerce').fillna(0)
 
-        deposits = df[df['Total Value'] > 0]['Total Value'].sum()
-        withdrawals = df[df['Total Value'] < 0]['Total Value'].sum()
-        net = deposits + withdrawals
+        flow_summary = report.get(schema.CASH_FLOWS, {})
+        deposited = flow_summary.get(schema.TOTAL_DEPOSITED,
+                                     frame[frame['Total Value'] > 0]['Total Value'].sum())
+        withdrawn = flow_summary.get(schema.TOTAL_WITHDRAWN,
+                                     abs(frame[frame['Total Value'] < 0]['Total Value'].sum()))
 
         m1, m2, m3 = st.columns(3)
-        m1.metric('Total Deposits', f'${deposits:,.2f}')
-        m2.metric('Total Withdrawals', f'${withdrawals:,.2f}')
-        m3.metric('Net Cash Flow', f'${net:,.2f}')
+        m1.metric('Deposited', money(deposited, 0))
+        m2.metric('Withdrawn', money(withdrawn, 0))
+        m3.metric('Net contributed', money(deposited - withdrawn, 0))
 
-        # Cumulative line chart
-        if 'Date' in df.columns and df['Date'].notna().any():
-            sorted_df = df.sort_values('Date')
-            sorted_df['Cumulative'] = sorted_df['Total Value'].cumsum()
-            fig = px.line(sorted_df, x='Date', y='Cumulative',
-                          title='Cumulative Net Cash Flow Over Time',
-                          labels={'Cumulative': 'Cumulative ($)'})
-            fig.update_layout(margin=dict(t=40, b=0))
-            st.plotly_chart(fig, use_container_width=True)
+        if needs_review:
+            st.warning(
+                f'{needs_review} transfer(s) are counted as external only because the '
+                'counterparty account is unrecognised. Resolve them in **Transfer Review**.',
+                icon='⚠️',
+            )
 
-        st.markdown('---')
-        st.subheader('Cash Flow Transactions')
-        display_cols = [c for c in ['Date', 'Description', 'Total Value', 'Category'] if c in df.columns]
-        fmt = {}
-        if 'Total Value' in df.columns:
-            fmt['Total Value'] = '${:,.2f}'
+        st.markdown('##### Money in, cumulatively')
+        ordered = frame.sort_values('Date')
+        ordered['Cumulative'] = ordered['Total Value'].cumsum()
+        fig = px.area(ordered, x='Date', y='Cumulative')
+        fig.update_traces(
+            line_color=colours['primary'], line_width=2,
+            fillcolor=f'rgba(42,120,214,0.12)' if not colours['dark']
+            else 'rgba(57,135,229,0.16)',
+            hovertemplate='%{x|%b %d, %Y}<br>$%{y:,.0f} contributed to date<extra></extra>',
+        )
+        theme.apply_layout(fig, colours, y_prefix='$')
+        fig.update_layout(height=300, xaxis_title=None, yaxis_title=None, hovermode='x unified')
+        fig.update_yaxes(tickformat=',.0f')
+        st.plotly_chart(fig, use_container_width=True)
 
-        def _color_flow(val):
-            if isinstance(val, (int, float)):
-                return 'color: green' if val > 0 else 'color: red'
-            return ''
-
+        st.markdown('##### Every deposit and withdrawal')
+        columns = [c for c in ['Date', 'Description', 'Total Value', 'Category', 'Needs Review']
+                   if c in frame.columns]
         st.dataframe(
-            df[display_cols].sort_values('Date', ascending=False).style.map(
-                _color_flow, subset=['Total Value'] if 'Total Value' in display_cols else []
-            ).format(fmt, na_rep='—'),
-            use_container_width=True,
-            hide_index=True,
+            frame[columns].sort_values('Date', ascending=False).style
+            .map(lambda v: f'color: {colours["positive"] if v > 0 else colours["negative"]}'
+                 if isinstance(v, (int, float)) and v else '',
+                 subset=['Total Value'])
+            .format({'Total Value': signed_money, 'Date': '{:%b %d, %Y}'}, na_rep='—'),
+            use_container_width=True, hide_index=True,
         )
 
-# ── Income tab ────────────────────────────────────────────────────────────────
+        internal = (
+            transactions[transactions['Category'] == classify.INTERNAL]
+            if transactions is not None and 'Category' in transactions.columns
+            else pd.DataFrame()
+        )
+        if not internal.empty:
+            with st.expander(
+                f'{len(internal)} transfer(s) excluded as internal — why they were excluded'
+            ):
+                st.caption(
+                    'Money moving between your own accounts is not a contribution or a '
+                    'withdrawal, so it is kept out of the totals above. Shown here so '
+                    'nothing is silently dropped.'
+                )
+                columns = [c for c in ['Date', 'Security Name', 'Total Value', 'Account',
+                                       'Classification Note'] if c in internal.columns]
+                st.dataframe(
+                    internal[columns].sort_values('Date', ascending=False)
+                    .rename(columns={'Security Name': 'Description',
+                                     'Classification Note': 'Why'})
+                    .style.format({'Total Value': '${:,.2f}', 'Date': '{:%b %d, %Y}'},
+                                  na_rep='—'),
+                    use_container_width=True, hide_index=True,
+                )
+
+# ── Income ────────────────────────────────────────────────────────────────────
+
 with income_tab:
     income = portfolio.get('income')
-    if income is None or (hasattr(income, 'empty') and income.empty):
-        st.info('No income data available.')
+    if income is None or income.empty:
+        st.info('No dividends or interest in the loaded date range.')
     else:
-        inc = income.copy()
-        if 'Date' in inc.columns:
-            inc['Date'] = pd.to_datetime(inc['Date'], errors='coerce')
-        if 'Total Value' in inc.columns:
-            inc['Total Value'] = pd.to_numeric(inc['Total Value'], errors='coerce').fillna(0)
-
-        total_income = inc['Total Value'].sum()
-        n_txns = len(inc)
-        largest = inc['Total Value'].max()
+        frame = income.copy()
+        frame['Date'] = pd.to_datetime(frame['Date'], errors='coerce')
+        frame['Total Value'] = pd.to_numeric(frame['Total Value'], errors='coerce').fillna(0)
 
         m1, m2, m3 = st.columns(3)
-        m1.metric('Total Income', f'${total_income:,.2f}')
-        m2.metric('# Transactions', n_txns)
-        m3.metric('Largest Payment', f'${largest:,.2f}')
+        m1.metric('Total income', money(frame['Total Value'].sum(), 0))
+        m2.metric('Payments', len(frame))
+        m3.metric('Largest payment', money(frame['Total Value'].max()))
 
-        # Monthly bar chart
-        if 'Date' in inc.columns and inc['Date'].notna().any():
-            monthly = inc.copy()
-            monthly['Month'] = monthly['Date'].dt.to_period('M').astype(str)
-            group_col = 'Transaction Type' if 'Transaction Type' in monthly.columns else None
-
-            if group_col:
-                agg = monthly.groupby(['Month', group_col])['Total Value'].sum().reset_index()
-                fig = px.bar(agg, x='Month', y='Total Value', color=group_col,
-                             title='Monthly Income by Type',
-                             labels={'Total Value': 'Income ($)'})
-            else:
-                agg = monthly.groupby('Month')['Total Value'].sum().reset_index()
-                fig = px.bar(agg, x='Month', y='Total Value',
-                             title='Monthly Income',
-                             labels={'Total Value': 'Income ($)'})
-
-            fig.update_layout(margin=dict(t=40, b=0))
-            st.plotly_chart(fig, use_container_width=True)
-
-        # By type breakdown
-        if 'Transaction Type' in inc.columns:
-            st.markdown('---')
-            st.subheader('By Type')
-            by_type = inc.groupby('Transaction Type').agg(
-                Total=('Total Value', 'sum'),
-                Count=('Total Value', 'count'),
-            ).reset_index()
-            st.dataframe(by_type.style.format({'Total': '${:,.2f}'}, na_rep='—'),
-                         use_container_width=True, hide_index=True)
-
-        st.markdown('---')
-        st.subheader('Income Transactions')
-        display_cols = [c for c in ['Date', 'Description', 'Transaction Type', 'Total Value'] if c in inc.columns]
-        st.dataframe(
-            inc[display_cols].sort_values('Date', ascending=False).style.format(
-                {'Total Value': '${:,.2f}'}, na_rep='—'
-            ),
-            use_container_width=True,
-            hide_index=True,
+        st.markdown('##### Income by month')
+        monthly = frame.copy()
+        monthly['Month'] = monthly['Date'].dt.to_period('M').dt.to_timestamp()
+        group = 'Transaction Type' if 'Transaction Type' in monthly.columns else None
+        grouped = (
+            monthly.groupby(['Month', group])['Total Value'].sum().reset_index()
+            if group else monthly.groupby('Month')['Total Value'].sum().reset_index()
         )
+        fig = px.bar(
+            grouped, x='Month', y='Total Value', color=group,
+            color_discrete_sequence=colours['categorical'],
+        )
+        fig.update_traces(
+            marker_cornerradius=3, marker_line_color=colours['surface'], marker_line_width=1,
+            hovertemplate='%{x|%b %Y}: $%{y:,.2f}<extra>%{fullData.name}</extra>',
+        )
+        theme.apply_layout(fig, colours, y_prefix='$')
+        fig.update_layout(height=320, xaxis_title=None, yaxis_title=None, barmode='stack')
+        fig.update_yaxes(tickformat=',.0f')
+        st.plotly_chart(fig, use_container_width=True)
+
+        if group:
+            st.markdown('##### By type')
+            by_type = frame.groupby(group).agg(
+                Total=('Total Value', 'sum'), Payments=('Total Value', 'count'),
+            ).reset_index().sort_values('Total', ascending=False)
+            st.dataframe(
+                by_type.style.format({'Total': '${:,.2f}'}),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.markdown('##### Every payment')
+        columns = [c for c in ['Date', 'Description', 'Transaction Type', 'Total Value']
+                   if c in frame.columns]
+        st.dataframe(
+            frame[columns].sort_values('Date', ascending=False).style.format(
+                {'Total Value': '${:,.2f}', 'Date': '{:%b %d, %Y}'}, na_rep='—'),
+            use_container_width=True, hide_index=True,
+        )
+
+# ── Transfer review ───────────────────────────────────────────────────────────
+
+with review_tab:
+    st.markdown(
+        'E\\*TRADE describes a move between your own accounts and a withdrawal to an '
+        'outside account almost identically. Where two legs share a reference number '
+        'and cancel out, the app pairs them and excludes both automatically. What is '
+        'left is below — tag each account once and the answer is remembered.'
+    )
+
+    if transactions is None or transactions.empty:
+        st.info('No transactions loaded.')
+    elif is_guest():
+        st.info('Guest view — tagging is read-only.')
+    else:
+        pending = classify.unresolved_counterparties(transactions)
+        current_map = account_map_store.load()
+
+        if pending.empty:
+            st.success('Nothing to review — every transfer has been resolved.')
+        else:
+            st.caption(
+                'Each row is currently counted as an **external** cash flow. Tag it as '
+                'yours to exclude it from deposits and withdrawals.'
+            )
+            for _, row in pending.iterrows():
+                account = row['Counterparty']
+                left, right = st.columns([3, 2])
+                with left:
+                    st.markdown(
+                        f'**Account ending {account}** — {row["Transfers"]} transfer(s), '
+                        f'net {money(row["Net Amount"])}  \n'
+                        f'<span style="opacity:.7">'
+                        f'{pd.Timestamp(row["First"]):%b %Y} to '
+                        f'{pd.Timestamp(row["Last"]):%b %Y}</span>',
+                        unsafe_allow_html=True,
+                    )
+                with right:
+                    choice = st.radio(
+                        f'Account {account}',
+                        ['Not yet decided', 'My own account', 'Someone else / a bank'],
+                        key=f'review_{account}', horizontal=False,
+                        label_visibility='collapsed',
+                    )
+                    if choice != 'Not yet decided' and st.button(
+                        'Save', key=f'save_{account}', use_container_width=True
+                    ):
+                        account_map_store.tag(
+                            account,
+                            account_map_store.INTERNAL if choice == 'My own account'
+                            else account_map_store.EXTERNAL,
+                        )
+                        st.success(
+                            f'Saved. Refresh from E\\*TRADE to apply it to the figures.'
+                        )
+                st.markdown('---')
+
+        if current_map:
+            with st.expander('Accounts you have already tagged'):
+                tagged = pd.DataFrame(
+                    [{'Account': f'…{k}', 'Treated as': v} for k, v in sorted(current_map.items())]
+                )
+                st.dataframe(tagged, use_container_width=True, hide_index=True)
+                st.caption(
+                    'To change one, tag it again from the list above after the next refresh.'
+                )

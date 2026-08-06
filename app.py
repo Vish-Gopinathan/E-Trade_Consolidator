@@ -1,7 +1,19 @@
+"""
+Dashboard entry point: authentication, navigation, and the E*TRADE refresh.
+
+    streamlit run app.py
+
+Page order and grouping come from :func:`st.navigation` at the bottom of this
+file rather than from numeric filename prefixes, so reordering the app is a
+one-line edit here.
+"""
+
+import datetime
+import hashlib
 import hmac
 import io
-import os
-import datetime
+import logging
+import traceback
 
 import pandas as pd
 import streamlit as st
@@ -11,9 +23,12 @@ from portfolio import paths
 
 load_dotenv(paths.ROOT / '.env')
 
-from portfolio.session import get_oauth_url, complete_oauth
-from portfolio.storage.cache import save_portfolio, load_portfolio
-from ui.common import render_sidebar_status, get_secret, is_guest
+from portfolio import analytics, classify, etrade, excel, schema  # noqa: E402
+from portfolio.storage import accounts as account_map_store       # noqa: E402
+from portfolio.storage import cache, snapshot                     # noqa: E402
+from ui.common import get_secret, is_guest, money, render_sidebar_status  # noqa: E402
+
+LOGGER = logging.getLogger(__name__)
 
 _MAX_LOGIN_ATTEMPTS = 5
 _LOCKOUT_MINUTES = 15
@@ -26,432 +41,473 @@ st.set_page_config(
     initial_sidebar_state='expanded',
 )
 
-# ── Helper ────────────────────────────────────────────────────────────────────
 
-def _refresh_data(start_date, end_date):
+# ── Authentication ────────────────────────────────────────────────────────────
+
+def _password_matches(entered: str, secret: str) -> bool:
+    """
+    Constant-time comparison against a stored password or salted hash.
+
+    ``APP_PASSWORD_HASH`` holds ``salt$sha256(salt + password)``; a plain
+    ``APP_PASSWORD`` still works so an existing install keeps running, but the
+    hashed form keeps the password out of the environment in readable form.
+    """
+    if not entered or not secret:
+        return False
+    if '$' in secret:
+        salt, expected = secret.split('$', 1)
+        digest = hashlib.sha256((salt + entered).encode()).hexdigest()
+        return hmac.compare_digest(digest, expected)
+    return hmac.compare_digest(entered.encode(), secret.encode())
+
+
+def _login_gate() -> None:
+    """
+    Render the password prompt and stop the script until it is satisfied.
+
+    The attempt counter lives in ``st.session_state``, so it slows down a person
+    guessing in one browser tab but does **not** survive a reload and is no
+    defence against a scripted attacker. It is a speed bump. Anything reachable
+    from the public internet needs a real authenticating proxy in front of it —
+    see docs/GUIDE.md.
+    """
+    st.title('Portfolio Dashboard')
+
+    locked_until = st.session_state.get('locked_until')
+    if locked_until and datetime.datetime.now() < locked_until:
+        minutes = int((locked_until - datetime.datetime.now()).total_seconds() // 60) + 1
+        st.error(f'Too many failed attempts. Try again in {minutes} minute(s).')
+        st.stop()
+
+    app_secret = get_secret('APP_PASSWORD_HASH') or get_secret('APP_PASSWORD')
+    guest_secret = get_secret('GUEST_PASSWORD')
+
+    if not app_secret:
+        st.error(
+            'No app password is configured. Copy `.env.example` to `.env` and set '
+            '`APP_PASSWORD_HASH`, or add it to Streamlit secrets.'
+        )
+        st.stop()
+
+    st.markdown('Enter the app password to continue.')
+    entered = st.text_input('Password', type='password', key='login_pwd')
+    submitted = st.button('Log in', type='primary')
+
+    if not (submitted or entered):
+        st.stop()
+
+    role = None
+    if _password_matches(entered, app_secret):
+        role = 'admin'
+    elif guest_secret and _password_matches(entered, guest_secret):
+        role = 'guest'
+
+    if role:
+        st.session_state.update(
+            authenticated=True, role=role, login_attempts=0,
+            last_activity=datetime.datetime.now(),
+        )
+        st.rerun()
+
+    if entered:
+        attempts = st.session_state.get('login_attempts', 0) + 1
+        st.session_state.login_attempts = attempts
+        if attempts >= _MAX_LOGIN_ATTEMPTS:
+            st.session_state.locked_until = (
+                datetime.datetime.now() + datetime.timedelta(minutes=_LOCKOUT_MINUTES)
+            )
+            st.error(f'Too many failed attempts. Locked for {_LOCKOUT_MINUTES} minutes.')
+        else:
+            st.error(
+                f'Incorrect password. {_MAX_LOGIN_ATTEMPTS - attempts} attempt(s) '
+                'remaining before lockout.'
+            )
+    st.stop()
+
+
+def _enforce_session_timeout() -> None:
+    """Clear the session after a long idle period."""
+    last_activity = st.session_state.get('last_activity')
+    if last_activity:
+        idle_hours = (datetime.datetime.now() - last_activity).total_seconds() / 3600
+        if idle_hours > _SESSION_TIMEOUT_HOURS:
+            st.session_state.clear()
+            st.warning('Session expired after inactivity. Please log in again.')
+            st.stop()
+    st.session_state.last_activity = datetime.datetime.now()
+
+
+# ── Data refresh ──────────────────────────────────────────────────────────────
+
+def _refresh_data(start_date, end_date) -> None:
+    """
+    Pull everything from E*TRADE and rebuild the session portfolio.
+
+    Each step reports its own failure rather than collapsing into one generic
+    error, because "connection failed" and "analytics failed" call for entirely
+    different responses from the user.
+    """
     import math
-    from portfolio import etrade as c
-    from portfolio import analytics as a
 
     auth_tokens = st.session_state['auth_tokens']
 
     with st.status('Refreshing portfolio data…', expanded=True) as status:
-
-        # ── Step 1: accounts ─────────────────────────────────────────────────
-        st.write('🔗 Connecting to E-Trade…')
+        st.write('🔗 Connecting to E\\*TRADE…')
         try:
-            active_accounts, accounts_obj = c.fetch_active_accounts(auth_tokens)
-            st.session_state['active_accounts'] = active_accounts
-            st.session_state['accounts_obj'] = accounts_obj
-        except Exception as e:
-            status.update(label='Connection failed', state='error', expanded=True)
-            st.error(f'Failed to fetch accounts: {e}')
+            active_accounts, accounts_obj = etrade.fetch_active_accounts(auth_tokens)
+        except Exception as exc:
+            status.update(label='Connection failed', state='error')
+            st.error(f'Could not fetch accounts: {exc}')
             return
+        st.session_state['active_accounts'] = active_accounts
+        st.session_state['accounts_obj'] = accounts_obj
+        st.write(f'✅ {len(active_accounts)} active account(s)')
 
-        n_accounts = len(active_accounts)
-        st.write(f'✅ Found {n_accounts} active account(s)')
-
-        # ── Step 2: holdings ─────────────────────────────────────────────────
-        st.write('📊 Fetching holdings and cash balances…')
+        st.write('📊 Fetching positions and balances…')
         try:
-            all_holdings = []
-            total_account_balance = 0.0  # authoritative total — matches E*TRADE website
+            frames, balances = [], []
             for key in active_accounts['accountIdKey']:
-                df = c.get_portfolio(accounts_obj, key)
-                all_holdings.append(df)
-                totals = c.get_account_totals(accounts_obj, key)
-                total_account_balance += totals['account_balance']
+                frames.append(etrade.get_portfolio(accounts_obj, key))
+                balances.append(etrade.get_account_totals(accounts_obj, key))
 
-            combined_df = pd.concat(all_holdings, ignore_index=True)
-            # Derive cash as the residual: account total minus what positions already account for
-            total_positions_value = combined_df['Market Value'].sum()
-            cash_for_display = max(total_account_balance - total_positions_value, 0.0)
+            positions = [f for f in frames if not f.empty]
+            combined = pd.concat(positions, ignore_index=True) if positions else pd.DataFrame()
 
-            holdings_df = c.consolidate_holdings(combined_df, cash=cash_for_display)
-        except Exception as e:
-            status.update(label='Failed to fetch holdings', state='error', expanded=True)
-            st.error(f'Failed to fetch holdings: {e}')
+            # Cash is what E*TRADE reports as free cash, not a residual. Deriving
+            # it by subtraction produced a negative number that clamped to zero.
+            cash = sum(b['net_cash'] for b in balances)
+            reported_total = sum(b['total_account_value'] for b in balances)
+            holdings = etrade.consolidate_holdings(combined, cash=cash)
+        except Exception as exc:
+            status.update(label='Failed to fetch holdings', state='error')
+            st.error(f'Could not fetch holdings: {exc}')
             return
 
-        n_holdings = len(holdings_df[holdings_df['Symbol'] != 'CASH']) if not holdings_df.empty else 0
-        st.write(f'✅ Holdings loaded — {n_holdings} positions, ${cash_for_display:,.2f} cash')
-
-        # ── Step 3: transactions with progress bar ────────────────────────────
-        days = (end_date - start_date).days + 1
-        n_chunks = max(1, math.ceil(days / 89))
-        total_steps = n_accounts * n_chunks
+        positions_value = float(combined['Market Value'].sum()) if not combined.empty else 0.0
         st.write(
-            f'🔄 Fetching transactions ({start_date} → {end_date}, '
-            f'{n_chunks} date chunk(s) × {n_accounts} account(s))…'
+            f'✅ {len(holdings[holdings["Symbol"] != "CASH"])} positions '
+            f'({money(positions_value)}) · {money(cash)} cash'
         )
-        progress = st.progress(0, text='Starting transaction fetch…')
 
+        drift = abs(reported_total - (positions_value + cash))
+        if reported_total and drift > max(50.0, reported_total * 0.005):
+            st.warning(
+                f'E\\*TRADE reports a total account value of {money(reported_total)}, '
+                f'but positions plus cash come to {money(positions_value + cash)} — '
+                f'a {money(drift)} difference. Usually unsettled trades or a pending '
+                'transfer; check the per-account breakdown on Overview.'
+            )
+
+        days = (end_date - start_date).days + 1
+        chunks = max(1, math.ceil(days / 89))
+        st.write(f'🔄 Fetching transactions ({start_date} → {end_date}, {chunks} window(s))…')
+        progress = st.progress(0.0, text='Starting…')
         try:
-            all_txn_frames = []
-            for acct_idx, key in enumerate(active_accounts['accountIdKey']):
+            frames = []
+            accounts = list(active_accounts.itertuples())
+            for index, account in enumerate(accounts):
                 progress.progress(
-                    acct_idx / n_accounts,
-                    text=f'Account {acct_idx + 1}/{n_accounts} — fetching transactions…',
+                    index / len(accounts),
+                    text=f'Account {index + 1} of {len(accounts)}…',
                 )
-                acct_txns = c.get_consolidated_transactions(accounts_obj, key, start_date, end_date)
-                all_txn_frames.append(acct_txns)
-                progress.progress(
-                    (acct_idx + 1) / n_accounts,
-                    text=f'Account {acct_idx + 1}/{n_accounts} — done',
+                frames.append(etrade.get_consolidated_transactions(
+                    accounts_obj, account.accountIdKey, start_date, end_date,
+                    account_label=getattr(account, 'accountName', None) or account.accountIdKey,
+                ))
+            progress.progress(1.0, text='All accounts fetched')
+
+            frames = [f for f in frames if not f.empty]
+            transactions = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            if not transactions.empty:
+                transactions = classify.reconcile_transfers(
+                    transactions,
+                    own_accounts=active_accounts.get('accountId', pd.Series(dtype=str)).tolist(),
+                    account_map=account_map_store.load(),
                 )
-
-            progress.progress(1.0, text='All accounts processed')
-
-            if all_txn_frames:
-                transactions_df = pd.concat(all_txn_frames, ignore_index=True)
-                if not transactions_df.empty and 'Date' in transactions_df.columns:
-                    transactions_df = transactions_df.sort_values('Date', ascending=False).reset_index(drop=True)
-            else:
-                transactions_df = pd.DataFrame()
-
-        except Exception as e:
-            status.update(label='Failed to fetch transactions', state='error', expanded=True)
-            st.error(f'Failed to fetch transactions: {e}')
+                transactions = transactions.sort_values(
+                    'Date', ascending=False).reset_index(drop=True)
+        except Exception as exc:
+            status.update(label='Failed to fetch transactions', state='error')
+            st.error(f'Could not fetch transactions: {exc}')
             return
+        st.write(f'✅ {len(transactions):,} transaction(s)')
 
-        n_txns = len(transactions_df)
-        st.write(f'✅ Transactions loaded — {n_txns:,} record(s)')
-
-        # ── Step 4: analytics ─────────────────────────────────────────────────
         st.write('🧮 Computing analytics…')
         try:
-            cash_flows_df = c.get_cash_flows(transactions_df)
-            income_df = None
-            if not transactions_df.empty and 'Category' in transactions_df.columns:
-                income_rows = transactions_df[transactions_df['Category'] == 'Income'].copy()
-                if not income_rows.empty:
-                    income_df = income_rows[['Date', 'Security Name', 'Total Value', 'Transaction Type']].rename(
-                        columns={'Security Name': 'Description'}
-                    )
-
-            analytics = a.PortfolioAnalytics(
-                holdings_df,
-                transactions_df if not transactions_df.empty else None,
-                cash_flows_df if not cash_flows_df.empty else None,
-            )
-            analytics_report = analytics.generate_full_report()
-            summary = c.portfolio_summary(holdings_df, cash=cash_for_display)
-        except Exception as e:
-            status.update(label='Failed to compute analytics', state='error', expanded=True)
-            st.error(f'Failed to compute analytics: {e}')
+            cash_flows = classify.get_cash_flows(transactions)
+            income = classify.get_income(transactions)
+            report = analytics.PortfolioAnalytics(
+                holdings, transactions, cash_flows
+            ).generate_full_report()
+            summary = etrade.portfolio_summary(holdings, cash=cash)
+        except Exception as exc:
+            status.update(label='Failed to compute analytics', state='error')
+            st.error(f'Could not compute analytics: {exc}')
+            st.exception(exc)
             return
 
-        st.write('✅ Analytics complete')
-        status.update(label='Portfolio data refreshed!', state='complete', expanded=False)
+        needing_review = report[schema.CASH_FLOWS].get(schema.FLOWS_NEEDING_REVIEW, 0)
+        if needing_review:
+            st.write(
+                f'⚠️ {needing_review} transfer(s) counted as external because the '
+                'counterparty account is unrecognised — resolve on Cash Flows'
+            )
+        status.update(label='Portfolio data refreshed', state='complete', expanded=False)
 
-    fetched_at = datetime.datetime.now().isoformat()
     portfolio = {
-        'fetched_at': fetched_at,
-        'holdings': holdings_df,
-        'transactions': transactions_df,
-        'cash_flows': cash_flows_df,
-        'income': income_df if income_df is not None else pd.DataFrame(),
-        'analytics_report': analytics_report,
+        'fetched_at': datetime.datetime.now().isoformat(),
+        'holdings': holdings,
+        'transactions': transactions,
+        'cash_flows': cash_flows,
+        'income': income,
+        'analytics_report': report,
         'summary': summary,
+        'reported_total': reported_total,
+        'account_balances': [
+            {k: v for k, v in b.items() if k != 'raw_computed'} for b in balances
+        ],
     }
     st.session_state.portfolio = portfolio
+    st.session_state.pop('_is_snapshot', None)
 
     try:
-        save_portfolio(
-            holdings_df, transactions_df, cash_flows_df,
-            income_df if income_df is not None else pd.DataFrame(),
-            analytics_report, summary, fetched_at,
-        )
-    except Exception:
-        pass
+        cache.save_portfolio(portfolio)
+    except Exception as exc:
+        # Previously a bare `except: pass`, so a portfolio that failed to cache
+        # looked identical to one that saved — and vanished on the next restart.
+        LOGGER.exception('portfolio cache write failed')
+        st.warning(f'Data loaded but could not be cached to disk: {exc}')
 
     st.rerun()
 
 
-# ── Session timeout check ─────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
-if st.session_state.get('authenticated'):
-    last_activity = st.session_state.get('last_activity')
-    if last_activity:
-        idle_seconds = (datetime.datetime.now() - last_activity).total_seconds()
-        if idle_seconds > _SESSION_TIMEOUT_HOURS * 3600:
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
-            st.warning('Session expired after inactivity. Please log in again.')
-    st.session_state.last_activity = datetime.datetime.now()
+@st.cache_data(show_spinner='Building workbook…')
+def _build_workbook(kind: str, fetched_at: str) -> bytes:
+    """
+    Build an Excel workbook for download.
 
-# ── Password gate ────────────────────────────────────────────────────────────
+    Keyed on ``fetched_at`` so it is built once per dataset and served instantly
+    afterwards. The portfolio is read from session state rather than passed in,
+    because DataFrames are not hashable as cache keys.
+    """
+    portfolio = st.session_state.portfolio
+    buffer = io.BytesIO()
 
-APP_PASSWORD = get_secret('APP_PASSWORD')
-GUEST_PASSWORD = get_secret('GUEST_PASSWORD', '')
+    def _frame(key):
+        frame = portfolio.get(key)
+        return frame if frame is not None and not frame.empty else None
 
-if not st.session_state.get('authenticated'):
-    st.title('Portfolio Dashboard')
+    if kind == 'holdings':
+        excel.export_to_excel(
+            portfolio['holdings'],
+            transactions_df=_frame('transactions'),
+            cash_flows_df=_frame('cash_flows'),
+            income_df=_frame('income'),
+            output=buffer,
+        )
+    else:
+        excel.export_analytics_to_excel(
+            portfolio['holdings'], portfolio.get('analytics_report') or {}, output=buffer,
+        )
+    return buffer.getvalue()
 
-    # Brute-force lockout
-    locked_until = st.session_state.get('locked_until')
-    if locked_until and datetime.datetime.now() < locked_until:
-        remaining_min = int((locked_until - datetime.datetime.now()).total_seconds() // 60) + 1
-        st.error(f'Too many failed attempts. Try again in {remaining_min} minute(s).')
-        st.stop()
 
-    st.markdown('Please enter the app password to continue.')
-    pwd = st.text_input('Password', type='password', key='login_pwd')
-    if st.button('Login') or pwd:
-        if APP_PASSWORD and hmac.compare_digest(pwd.encode(), APP_PASSWORD.encode()):
-            st.session_state.authenticated = True
-            st.session_state.role = 'admin'
-            st.session_state.login_attempts = 0
-            st.session_state.last_activity = datetime.datetime.now()
-            st.rerun()
-        elif GUEST_PASSWORD and hmac.compare_digest(pwd.encode(), GUEST_PASSWORD.encode()):
-            st.session_state.authenticated = True
-            st.session_state.role = 'guest'
-            st.session_state.login_attempts = 0
-            st.session_state.last_activity = datetime.datetime.now()
-            st.rerun()
-        elif pwd:
-            attempts = st.session_state.get('login_attempts', 0) + 1
-            st.session_state.login_attempts = attempts
-            if attempts >= _MAX_LOGIN_ATTEMPTS:
-                st.session_state.locked_until = (
-                    datetime.datetime.now() + datetime.timedelta(minutes=_LOCKOUT_MINUTES)
+def _render_downloads() -> None:
+    """
+    Download buttons for both workbooks.
+
+    These are plain download buttons, not a Generate button that reveals one. In
+    that older two-step flow the download button was created inside
+    ``if st.button(...)``, so the next rerun — including the one the download
+    itself triggers — destroyed it before it could reliably be used.
+    """
+    portfolio = st.session_state.get('portfolio')
+    if not portfolio or is_guest():
+        return
+
+    fetched_at = portfolio.get('fetched_at', '')
+    file_date = (
+        portfolio.get('snapshot_date') or fetched_at[:10]
+        or datetime.date.today().isoformat()
+    )
+
+    st.markdown('---')
+    st.markdown('**Download**')
+    for kind, label, stem in (
+        ('holdings', '⬇ Holdings & transactions', 'portfolio'),
+        ('analytics', '⬇ Analytics', 'analytics'),
+    ):
+        try:
+            st.download_button(
+                label,
+                _build_workbook(kind, fetched_at),
+                f'{stem}_{file_date}.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key=f'dl_{kind}',
+                use_container_width=True,
+            )
+        except Exception:
+            st.error(f'Could not build the {kind} workbook.')
+            with st.expander('Details'):
+                st.code(traceback.format_exc())
+
+
+def _render_connection() -> None:
+    """E*TRADE OAuth: get a URL, paste the verifier, connect."""
+    connected = st.session_state.get('etrade_connected')
+    with st.expander('🔌 E\\*TRADE Connection', expanded=not connected):
+        if connected:
+            st.success('Connected')
+            if st.button('Disconnect', use_container_width=True):
+                for key in ('etrade_connected', 'auth_tokens', 'active_accounts', 'accounts_obj'):
+                    st.session_state.pop(key, None)
+                st.rerun()
+            return
+
+        if st.button('Get authorization URL', use_container_width=True):
+            try:
+                url, oauth, key, secret = etrade.get_oauth_url()
+                st.session_state.update(
+                    _oauth_obj=oauth, _consumer_key=key,
+                    _consumer_secret=secret, _oauth_url=url,
                 )
-                st.error(f'Too many failed attempts. Locked for {_LOCKOUT_MINUTES} minutes.')
-            else:
-                remaining = _MAX_LOGIN_ATTEMPTS - attempts
-                st.error(f'Incorrect password. {remaining} attempt(s) remaining before lockout.')
-    st.stop()
+            except Exception as exc:
+                st.error(f'Could not start authorization: {exc}')
 
-# ── Load cache on first run ──────────────────────────────────────────────────
+        if st.session_state.get('_oauth_url'):
+            st.link_button('Authorize on E\\*TRADE ↗', st.session_state['_oauth_url'],
+                           use_container_width=True)
+            verifier = st.text_input('Verifier code', key='verifier_input')
+            if st.button('Connect', type='primary', use_container_width=True) and verifier.strip():
+                try:
+                    st.session_state['auth_tokens'] = etrade.complete_oauth(
+                        st.session_state['_oauth_obj'], verifier.strip(),
+                        st.session_state['_consumer_key'],
+                        st.session_state['_consumer_secret'],
+                    )
+                    st.session_state['etrade_connected'] = True
+                    for key in ('_oauth_obj', '_consumer_key', '_consumer_secret', '_oauth_url'):
+                        st.session_state.pop(key, None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f'Connection failed: {exc}')
 
-if 'portfolio' not in st.session_state:
-    cached = load_portfolio()
-    if cached:
-        st.session_state.portfolio = cached
 
-# ── Sidebar: E-Trade connection + refresh ────────────────────────────────────
+def _render_snapshot_tools() -> None:
+    """
+    Save, export and restore a point-in-time snapshot.
 
-with st.sidebar:
+    Snapshots used to be written to this repo through the GitHub Contents API,
+    which would have published holdings and full transaction history to a public
+    repository. They are local files now; the download/upload pair is how you move
+    one between machines, under your control rather than automatically.
+    """
+    with st.expander('📅 Snapshot'):
+        st.caption(
+            'A saved point-in-time copy. Guests and cold starts see this. '
+            'Stored locally — download it to keep a copy elsewhere.'
+        )
+        portfolio = st.session_state.get('portfolio')
+
+        if portfolio and st.button('💾 Save current data as snapshot', use_container_width=True):
+            try:
+                snapshot.save(portfolio)
+                st.session_state.portfolio['snapshot_date'] = datetime.date.today().isoformat()
+                st.success(f'Snapshot saved — {datetime.date.today():%B %d, %Y}')
+            except Exception as exc:
+                LOGGER.exception('snapshot save failed')
+                st.error(f'Could not save the snapshot: {exc}')
+
+        if snapshot.exists():
+            st.download_button(
+                '⬇ Export snapshot file', snapshot.read_bytes(),
+                f'portfolio_snapshot_{datetime.date.today().isoformat()}.json',
+                mime='application/json', use_container_width=True,
+            )
+
+        uploaded = st.file_uploader('Restore a snapshot file', type='json')
+        if uploaded is not None and st.button('Restore', use_container_width=True):
+            try:
+                st.session_state.portfolio = snapshot.load_bytes(uploaded.getvalue())
+                st.session_state._is_snapshot = True
+                st.success('Snapshot restored.')
+                st.rerun()
+            except Exception as exc:
+                st.error(f'Could not read that snapshot: {exc}')
+
+
+def _render_sidebar() -> None:
     st.title('📈 Portfolio')
-
     render_sidebar_status()
 
     if is_guest():
-        st.sidebar.info('👁️ Guest view — read-only')
-    else:
-        # Admin-only: E-Trade connection
-        st.markdown('---')
-        with st.expander('🔌 E-Trade Connection', expanded=not st.session_state.get('etrade_connected')):
-            if not st.session_state.get('etrade_connected'):
-                if st.button('Get Authorization URL'):
-                    try:
-                        url, oauth_obj, ck, cs = get_oauth_url()
-                        st.session_state['_oauth_obj'] = oauth_obj
-                        st.session_state['_consumer_key'] = ck
-                        st.session_state['_consumer_secret'] = cs
-                        st.session_state['_oauth_url'] = url
-                    except Exception as e:
-                        st.error(f'Failed to get OAuth URL: {e}')
+        st.info('👁️ Guest view — read-only')
+        return
 
-                if st.session_state.get('_oauth_url'):
-                    st.link_button('Authorize on E-Trade ↗', st.session_state['_oauth_url'])
-                    verifier = st.text_input('Paste verifier code', key='verifier_input')
-                    if st.button('Connect') and verifier.strip():
-                        try:
-                            tokens = complete_oauth(
-                                st.session_state['_oauth_obj'],
-                                verifier.strip(),
-                                st.session_state['_consumer_key'],
-                                st.session_state['_consumer_secret'],
-                            )
-                            st.session_state['auth_tokens'] = tokens
-                            st.session_state['etrade_connected'] = True
-                            for k in ('_oauth_obj', '_consumer_key', '_consumer_secret', '_oauth_url'):
-                                st.session_state.pop(k, None)
-                            st.success('Connected!')
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f'Connection failed: {e}')
-            else:
-                st.success('Connected to E-Trade')
-                if st.button('Disconnect'):
-                    for k in ('etrade_connected', 'auth_tokens', 'active_accounts', 'accounts_obj'):
-                        st.session_state.pop(k, None)
-                    st.rerun()
-
-        if st.session_state.get('etrade_connected'):
-            st.markdown('---')
-            st.markdown('**Refresh Data**')
-            start_date = st.date_input(
-                'Start date',
-                value=datetime.date(2000, 1, 1),
-                min_value=datetime.date(1990, 1, 1),
-                max_value=datetime.date.today(),
-                key='refresh_start',
-            )
-            end_date = st.date_input(
-                'End date',
-                value=datetime.date.today(),
-                min_value=datetime.date(1990, 1, 1),
-                max_value=datetime.date.today(),
-                key='refresh_end',
-            )
-
-            if st.button('🔄 Refresh Data', type='primary'):
-                _refresh_data(start_date, end_date)
-
-# ── Home page ─────────────────────────────────────────────────────────────────
-
-st.title('Portfolio Dashboard')
-
-portfolio = st.session_state.get('portfolio')
-
-if not portfolio:
-    if is_guest():
-        st.warning(
-            'No portfolio snapshot is available yet. '
-            'Ask the account owner to save a month-end snapshot.',
-            icon='📅',
-        )
-    else:
-        st.info('No data loaded. Connect to E-Trade and click **Refresh Data**, or check that `data/portfolio_cache.json` exists.')
-    st.stop()
-
-summary = portfolio.get('summary') or {}
-fetched_at = portfolio.get('fetched_at', '')
-
-# Status banner
-if st.session_state.get('_is_snapshot'):
-    snap_date = portfolio.get('snapshot_date', fetched_at[:10])
-    st.info(
-        f'Viewing month-end snapshot as of **{snap_date}**. '
-        'Connect to E-Trade and refresh for live data.',
-        icon='📅',
-    )
-elif is_guest():
-    st.info('Guest view — read-only. Contact the account owner to refresh data.', icon='👁️')
-elif fetched_at:
-    ts = fetched_at[:19].replace('T', ' ')
-    label = '🟢 Live data' if st.session_state.get('etrade_connected') else '🟡 Cached data'
-    st.caption(f'{label} — last updated {ts}')
-
-# KPI row
-total_value = summary.get('Total Portfolio Value', 0)
-total_gain = summary.get('Total Unrealized Gain', 0)
-gain_pct = summary.get('Total Unrealized Gain %', 0)
-cash_pct = summary.get('Cash Percentage', 0)
-analytics_report = portfolio.get('analytics_report') or {}
-perf = analytics_report.get('Performance Metrics') or {}
-dietz = perf.get('Modified Dietz Return (%)')
-
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric('Portfolio Value', f'${total_value:,.2f}')
-col2.metric('Unrealized Gain', f'${total_gain:,.2f}', f'{gain_pct:.2f}%')
-col3.metric('Cash', f'{cash_pct:.1f}%')
-col4.metric('Holdings', summary.get('Total Stocks', '—'))
-if dietz is not None:
-    col5.metric('Deposit-Adj. Return', f'{dietz:.2f}%')
-
-st.markdown('---')
-
-# Top holdings preview
-holdings_df = portfolio.get('holdings')
-if holdings_df is not None and not holdings_df.empty:
-    st.subheader('Top Holdings')
-    display_cols = [c for c in [
-        'Symbol', 'Symbol Description', 'Market Value', 'Total Gain', 'Total Gain %', 'Percent of Portfolio'
-    ] if c in holdings_df.columns]
-    display = holdings_df[holdings_df['Symbol'] != 'CASH'][display_cols].sort_values(
-        'Market Value', ascending=False
-    ).head(10)
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-# Analytics snapshot
-if analytics_report:
     st.markdown('---')
-    st.subheader('Analytics Snapshot')
-    cols = st.columns(3)
-    conc = analytics_report.get('Concentration Analysis') or {}
-    risk = analytics_report.get('Risk Metrics') or {}
+    _render_connection()
 
-    with cols[0]:
-        st.markdown('**Concentration**')
-        hhi = conc.get('HHI Score')
-        if hhi:
-            st.metric('HHI Score', f'{hhi:.1f}')
-        top5 = conc.get('Top 5 Concentration (%)')
-        if top5:
-            st.metric('Top 5 Weight', f'{top5:.1f}%')
+    if st.session_state.get('etrade_connected'):
+        st.markdown('**Refresh from E\\*TRADE**')
+        start_date = st.date_input(
+            'From', value=datetime.date(2000, 1, 1),
+            min_value=datetime.date(1990, 1, 1), max_value=datetime.date.today(),
+            help='Reaching back past account opening is what makes the '
+                 'deposit-adjusted return meaningful.',
+        )
+        end_date = st.date_input(
+            'To', value=datetime.date.today(),
+            min_value=datetime.date(1990, 1, 1), max_value=datetime.date.today(),
+        )
+        if st.button('🔄 Refresh data', type='primary', use_container_width=True):
+            _refresh_data(start_date, end_date)
 
-    with cols[1]:
-        st.markdown('**Risk / Performance**')
-        sharpe = risk.get('Sharpe Ratio')
-        if sharpe is not None:
-            st.metric('Sharpe Ratio', f'{sharpe:.2f}')
-        win_rate = risk.get('Win Rate (%)')
-        if win_rate is not None:
-            st.metric('Win Rate', f'{win_rate:.1f}%')
+    _render_snapshot_tools()
+    _render_downloads()
 
-    with cols[2]:
-        st.markdown('**Income**')
-        inc_summary = analytics_report.get('Income Summary') or {}
-        total_income = inc_summary.get('Total Income')
-        if total_income:
-            st.metric('Total Income', f'${total_income:,.2f}')
-        n_inc = inc_summary.get('Number of Income Transactions')
-        if n_inc:
-            st.metric('Income Transactions', n_inc)
 
-# ── Excel download ────────────────────────────────────────────────────────────
+# ── Boot ──────────────────────────────────────────────────────────────────────
 
-st.markdown('---')
-st.subheader('Download')
+if st.session_state.get('authenticated'):
+    _enforce_session_timeout()
+else:
+    _login_gate()
 
-holdings_df = portfolio.get('holdings')
-txns_df = portfolio.get('transactions')
-cf_df = portfolio.get('cash_flows')
-income_df = portfolio.get('income')
-file_date = portfolio.get('snapshot_date', fetched_at[:10] if fetched_at else datetime.date.today().isoformat())
-
-dl1, dl2 = st.columns(2)
-
-with dl1:
-    if st.button('Generate Holdings & Transactions Excel', key='gen_holdings_xl'):
+if 'portfolio' not in st.session_state:
+    try:
+        cached = cache.load_portfolio()
+    except Exception:
+        LOGGER.exception('cache read failed')
+        cached = None
+    if cached:
+        st.session_state.portfolio = cached
+    elif snapshot.exists():
         try:
-            from portfolio import etrade as c
-            buf = io.BytesIO()
-            c.export_to_excel(
-                holdings_df,
-                transactions_df=txns_df if txns_df is not None and not (hasattr(txns_df, 'empty') and txns_df.empty) else None,
-                cash_flows_df=cf_df if cf_df is not None and not (hasattr(cf_df, 'empty') and cf_df.empty) else None,
-                income_df=income_df if income_df is not None and not (hasattr(income_df, 'empty') and income_df.empty) else None,
-                filename=buf,
-            )
-            buf.seek(0)
-            st.download_button(
-                '⬇ Download Holdings Excel',
-                buf,
-                f'portfolio_{file_date}.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                key='dl_holdings',
-            )
-        except Exception as e:
-            st.error(f'Failed to generate Excel: {e}')
+            st.session_state.portfolio = snapshot.load()
+            st.session_state._is_snapshot = True
+        except Exception:
+            LOGGER.exception('snapshot read failed')
 
-with dl2:
-    if st.button('Generate Analytics Excel', key='gen_analytics_xl'):
-        try:
-            from portfolio import analytics as a
-            buf = io.BytesIO()
-            a.export_analytics_to_excel(holdings_df, analytics_report, filename=buf)
-            buf.seek(0)
-            st.download_button(
-                '⬇ Download Analytics Excel',
-                buf,
-                f'analytics_{file_date}.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                key='dl_analytics',
-            )
-        except Exception as e:
-            st.error(f'Failed to generate Excel: {e}')
+with st.sidebar:
+    _render_sidebar()
+
+navigation = st.navigation({
+    'Portfolio': [
+        st.Page('ui/overview.py', title='Overview', icon='📈', default=True),
+        st.Page('ui/holdings.py', title='Holdings', icon='📊'),
+        st.Page('ui/history.py', title='Value Over Time', icon='📉'),
+        st.Page('ui/performance.py', title='Performance', icon='🎯'),
+    ],
+    'Money': [
+        st.Page('ui/cash_flows.py', title='Cash Flows & Income', icon='💵'),
+        st.Page('ui/transactions.py', title='Transactions', icon='🔄'),
+    ],
+    'Research': [
+        st.Page('ui/earnings.py', title='Earnings', icon='📅'),
+        st.Page('ui/thesis.py', title='Thesis Tracker', icon='🧠'),
+        st.Page('ui/what_if_hold.py', title='What-If: Hold', icon='🔮'),
+    ],
+})
+navigation.run()

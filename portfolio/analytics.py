@@ -36,12 +36,15 @@ _DEFAULT_SECTOR_GROUPS = {
     'ETFs/Index': ['SPY', 'IVV', 'VOO', 'QQQ', 'VTI', 'AGG', 'BND'],
 }
 
-#: Buckets for the gain distribution, as (label, low, high) with bounds in percent.
+#: Gain distribution buckets as ``(label, low, high)`` in percent, half-open
+#: ``[low, high)``. Half-open matters at zero: with inclusive upper bounds a
+#: position sitting at exactly 0.00% was counted as a small *loss*, so the buckets
+#: disagreed with the winner/loser counts on the same page.
 _GAIN_BUCKETS = [
     ('Major loss (< -50%)', -np.inf, -50),
     ('Moderate loss (-50% to -10%)', -50, -10),
     ('Small loss (-10% to 0%)', -10, 0),
-    ('Up to +50%', 0, 50),
+    ('Flat to +50%', 0, 50),
     ('Above +50%', 50, np.inf),
 ]
 
@@ -167,11 +170,22 @@ class PortfolioAnalytics:
         return result
 
     def concentration(self) -> dict:
-        """Concentration measures. HHI runs 0–10000; higher means less diversified."""
+        """
+        Concentration measures. HHI runs 0–10000; higher means less diversified.
+
+        Weights are re-normalised across **positions only**, excluding cash. The
+        holdings frame's ``Percent of Portfolio`` is a share of the whole account,
+        so on a portfolio that is 40% cash those weights sum to 60 — which
+        deflated HHI and produced the impossible "13.2 effective positions of 10
+        held". Concentration is a question about how the invested money is spread,
+        and cash is not invested.
+        """
         if self.holdings.empty:
             return {schema.TOTAL_POSITIONS: 0}
 
-        weights = self.holdings['Percent of Portfolio'].astype(float)
+        values = self.holdings['Market Value'].astype(float)
+        invested = float(values.sum())
+        weights = (values / invested * 100) if invested else values * 0
         hhi = float((weights ** 2).sum())
         ordered = weights.sort_values(ascending=False)
 
@@ -184,10 +198,11 @@ class PortfolioAnalytics:
             schema.TOP_5_PCT: round(float(ordered.head(5).sum()), 2),
             schema.TOP_10_PCT: round(float(ordered.head(10).sum()), 2),
             schema.POSITION_WEIGHTS: {
-                row['Symbol']: round(float(row['Percent of Portfolio']), 2)
-                for _, row in self.holdings.sort_values(
-                    'Percent of Portfolio', ascending=False
-                ).iterrows()
+                symbol: round(float(weight), 2)
+                for symbol, weight in sorted(
+                    zip(self.holdings['Symbol'], weights),
+                    key=lambda pair: pair[1], reverse=True,
+                )
             },
         }
 
@@ -289,7 +304,7 @@ class PortfolioAnalytics:
             schema.WIN_RATE_PCT: round(winners / len(gains) * 100, 2),
             schema.GAIN_DISPERSION_PCT: round(float(np.std(gains)), 2) if len(gains) > 1 else 0.0,
             schema.GAIN_DISTRIBUTION: {
-                label: int(((gains > low) & (gains <= high)).sum())
+                label: int(((gains >= low) & (gains < high)).sum())
                 for label, low, high in _GAIN_BUCKETS
             },
             schema.BEST_PERFORMER: {

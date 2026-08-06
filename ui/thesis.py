@@ -1,27 +1,14 @@
-import streamlit as st
+"""Thesis Tracker: why you own each position, and whether that still holds."""
+
 import pandas as pd
-from ui.common import require_auth, render_sidebar_status, STATUS_COLORS
-from portfolio.storage.thesis import load_all, get, save_stock, STATUS_OPTIONS, STATUS_EMOJI
+import streamlit as st
 
-st.set_page_config(page_title='Thesis Tracker', page_icon='🧠', layout='wide')
-require_auth()
+from portfolio.storage.thesis import STATUS_EMOJI, STATUS_OPTIONS, get, load_all, save_stock
+from ui.common import STATUS_COLORS, page_header, require_portfolio
 
-with st.sidebar:
-    st.title('📈 Portfolio')
-    render_sidebar_status()
+page_header('Thesis Tracker', '🧠')
 
-st.title('🧠 Thesis Tracker')
-
-portfolio = st.session_state.get('portfolio')
-if not portfolio:
-    st.warning('No data loaded. Go to the home page and refresh.')
-    st.stop()
-
-holdings_df = portfolio.get('holdings')
-if holdings_df is None or (hasattr(holdings_df, 'empty') and holdings_df.empty):
-    st.info('No holdings data available.')
-    st.stop()
-
+holdings_df = require_portfolio('holdings')
 symbols = sorted(holdings_df[holdings_df['Symbol'] != 'CASH']['Symbol'].unique().tolist())
 thesis_data = load_all()
 

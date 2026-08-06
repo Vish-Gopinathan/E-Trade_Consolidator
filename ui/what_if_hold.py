@@ -1,310 +1,278 @@
-import re
+"""
+What-If: Hold — was selling the right call?
+
+**The framing.** The number reported is *decision value*: proceeds minus what the
+position would be worth today. Positive means selling beat holding; negative means
+holding would have won. An earlier version measured the opposite direction, so a
+"good" outcome was a negative number painted red — technically consistent, and
+backwards from every other green-is-good number in the app.
+
+**Percent leads, dollars follow.** A dollar difference mostly measures how large
+the position was. Selling $80k of one stock badly and $800 of another badly are
+the same decision, made at different sizes; the percentage is what says whether
+the call was right.
+
+Colour alone cannot carry this — the green/red pair sits at ΔE 7.2 for protanopia
+(see :mod:`ui.theme`). Every mark is therefore also placed by sign against a zero
+line, directly labelled with its value, and repeated in the table below.
+"""
+
 import datetime
+import re
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from ui.common import require_auth, render_sidebar_status
-from portfolio.market import get_current_prices, get_split_history, cumulative_split_factor
 
-st.set_page_config(page_title='What-If: Hold Analysis', page_icon='🔮', layout='wide')
-require_auth()
+from portfolio.market import cumulative_split_factor, get_current_prices, get_split_history
+from ui import theme
+from ui.common import money, page_header, percent, require_portfolio, signed_money
 
-with st.sidebar:
-    st.title('📈 Portfolio')
-    render_sidebar_status()
-
-st.title('🔮 What-If: Hold Analysis')
-st.caption(
-    'See what your sold positions would be worth today if you had held them. '
-    'Positive difference = you left gains on the table. Negative = good timing.'
+page_header(
+    'What-If: Hold', '🔮',
+    'What your sold positions would be worth today if you had kept them.',
 )
 
-portfolio = st.session_state.get('portfolio')
-if not portfolio:
-    st.warning('No data loaded. Go to the home page and refresh.')
-    st.stop()
+transactions = require_portfolio('transactions')
+colours = theme.palette()
 
-transactions_df = portfolio.get('transactions')
-if transactions_df is None or transactions_df.empty:
-    st.info('No transaction data available. Refresh data from the home page.')
-    st.stop()
+# ── Range ─────────────────────────────────────────────────────────────────────
 
-# ── Date range ─────────────────────────────────────────────────────────────────
+# Default to the whole sell history rather than year-to-date. Most accounts have
+# no sales in the current calendar year, so the old default opened on "no sales in
+# that date range" — which reads as a broken page rather than a narrow filter.
+_sell_dates = pd.to_datetime(
+    transactions.loc[transactions['Transaction Type'] == 'Sold', 'Date'], errors='coerce'
+).dropna()
+_earliest_sell = _sell_dates.min().date() if len(_sell_dates) else datetime.date(
+    datetime.date.today().year, 1, 1)
 
-st.markdown('### Date Range')
-col1, col2, col3 = st.columns([2, 2, 1])
-with col1:
-    default_start = datetime.date(datetime.date.today().year, 1, 1)
-    start_date = st.date_input('From', value=default_start, key='wih_start')
-with col2:
+c1, c2, c3 = st.columns([2, 2, 1])
+with c1:
+    start_date = st.date_input('From', value=_earliest_sell, key='wih_start')
+with c2:
     end_date = st.date_input('To', value=datetime.date.today(), key='wih_end')
-with col3:
-    st.markdown('<div style="margin-top:28px"></div>', unsafe_allow_html=True)
-    run = st.button('Run Analysis', type='primary')
+with c3:
+    st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
+    run = st.button('Run analysis', type='primary', use_container_width=True)
 
 if not run and 'wih_result' not in st.session_state:
-    st.info('Choose a date range and click **Run Analysis**.')
+    st.info('Choose a date range and select **Run analysis**.')
     st.stop()
 
-# ── Filter sold trades ─────────────────────────────────────────────────────────
 
-if run:
-    # Normalise date column
-    df = transactions_df.copy()
-    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+def _symbol_from_description(description: str) -> str:
+    """
+    Recover a ticker from a sell description when the API did not supply one.
 
-    mask = (
-        (df['Category'] == 'Trade') &
-        (df['Transaction Type'] == 'Sold') &
-        (df['Date'].dt.date >= start_date) &
-        (df['Date'].dt.date <= end_date)
-    )
-    sells = df[mask].copy()
-
-    if sells.empty:
-        st.info('No sell transactions found in the selected date range.')
-        st.session_state.pop('wih_result', None)
-        st.stop()
-
-    # ── Resolve ticker symbols ─────────────────────────────────────────────────
-
-    def _parse_symbol_from_description(desc: str) -> str:
-        """
-        Fallback: E*TRADE sell descriptions are typically
-        'SOLD {qty} {TICKER} AT {price}' or 'SOLD {qty} {TICKER} @ {price}'.
-        Take the third whitespace-separated token if it looks like a ticker.
-        """
-        if not desc:
-            return ''
-        tokens = desc.strip().split()
-        candidates = []
-        for tok in tokens:
-            # Strip trailing punctuation, keep only uppercase letters
-            clean = re.sub(r'[^A-Z]', '', tok.upper())
-            if 1 <= len(clean) <= 5 and clean not in ('SOLD', 'BOUGHT', 'AT', 'OF', 'FOR'):
-                candidates.append(clean)
-        # The first candidate after filtering keywords is usually the ticker
-        return candidates[0] if candidates else ''
-
-    if 'Symbol' not in sells.columns:
-        sells['Symbol'] = ''
-
-    missing_symbol = sells['Symbol'].isna() | (sells['Symbol'] == '')
-    if missing_symbol.any():
-        sells.loc[missing_symbol, 'Symbol'] = sells.loc[missing_symbol, 'Security Name'].apply(
-            _parse_symbol_from_description
-        )
-
-    # Drop rows where we still can't determine the symbol
-    sells = sells[sells['Symbol'].notna() & (sells['Symbol'] != '')].copy()
-
-    if sells.empty:
-        st.warning('Could not determine ticker symbols for any sell transactions in this range.')
-        st.stop()
-
-    # ── Aggregate by symbol ────────────────────────────────────────────────────
-
-    # E-Trade stores quantity as negative for sells (position decreases); take abs so
-    # shares and proceeds are positive magnitudes throughout the analysis.
-    sells['Quantity'] = pd.to_numeric(sells['Quantity'], errors='coerce').abs()
-    sells['Total Value'] = pd.to_numeric(sells['Total Value'], errors='coerce').abs()
-
-    # ── Fetch split history and adjust share counts ────────────────────────────
-
-    symbols_for_splits = tuple(sorted(sells['Symbol'].unique().tolist()))
-    with st.spinner(f'Fetching price and split data for {len(symbols_for_splits)} symbol(s)…'):
-        prices = get_current_prices(symbols_for_splits)
-        split_hist = get_split_history(symbols_for_splits)
-
-    # Apply cumulative split factor per transaction row.
-    # A sell of 100 NVDA shares in 2023 before the 10:1 June-2024 split would
-    # represent 1,000 equivalent shares today — the factor corrects for this.
-    def _sell_date(row):
-        try:
-            return row['Date'].date()
-        except Exception:
-            return pd.Timestamp(row['Date']).date()
-
-    sells['_split_factor'] = sells.apply(
-        lambda r: cumulative_split_factor(
-            split_hist.get(r['Symbol'], pd.Series(dtype=float)),
-            _sell_date(r),
-        ),
-        axis=1,
-    )
-    sells['_adj_shares'] = sells['Quantity'] * sells['_split_factor']
-
-    agg = sells.groupby('Symbol').agg(
-        Description=('Security Name', 'first'),
-        Shares_Sold=('Quantity', 'sum'),        # original pre-split count at time of sale
-        Shares_Held=('_adj_shares', 'sum'),     # split-adjusted equivalent today
-        Total_Proceeds=('Total Value', 'sum'),
-        First_Sell=('Date', 'min'),
-        Last_Sell=('Date', 'max'),
-        Num_Transactions=('Date', 'count'),
-    ).reset_index()
-
-    agg['Avg_Sale_Price'] = agg['Total_Proceeds'] / agg['Shares_Sold']
-    # Weighted average split factor across all sell tranches for display
-    agg['Split_Factor'] = (agg['Shares_Held'] / agg['Shares_Sold']).round(4)
-
-    agg['Current_Price'] = agg['Symbol'].map(prices)
-    agg['Current_Value'] = agg['Shares_Held'] * agg['Current_Price']   # uses adjusted shares
-    agg['Difference'] = agg['Current_Value'] - agg['Total_Proceeds']
-    agg['Difference_Pct'] = (agg['Difference'] / agg['Total_Proceeds']) * 100
-
-    st.session_state['wih_result'] = agg
-
-# ── Display ────────────────────────────────────────────────────────────────────
-
-agg = st.session_state.get('wih_result')
-if agg is None or agg.empty:
-    st.stop()
-
-valid = agg[agg['Current_Price'].notna()]
-unavailable = agg[agg['Current_Price'].isna()]
-
-# Summary KPIs
-total_proceeds = valid['Total_Proceeds'].sum()
-total_current = valid['Current_Value'].sum()
-net_diff = valid['Difference'].sum()
-net_diff_pct = (net_diff / total_proceeds * 100) if total_proceeds else 0
-
-st.markdown('---')
-st.markdown('### Summary')
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric('Total Proceeds (sold)', f'${total_proceeds:,.2f}')
-k2.metric('Current Value if Held', f'${total_current:,.2f}')
-k3.metric(
-    'Net Difference',
-    f'${net_diff:,.2f}',
-    delta=f'{net_diff_pct:+.2f}%',
-    delta_color='inverse',  # positive diff (left money on table) shows red
-)
-k4.metric('Symbols Analysed', len(valid))
-
-if not unavailable.empty:
-    st.caption(
-        f"⚠️ No current price available for: {', '.join(unavailable['Symbol'].tolist())} "
-        f"(delisted or ticker changed) — excluded from totals."
-    )
-
-st.markdown('---')
-st.markdown('### Position Detail')
-
-has_splits = (valid['Split_Factor'] != 1.0).any()
-
-if has_splits:
-    display = valid[[
-        'Symbol', 'Description', 'Shares_Sold', 'Split_Factor', 'Shares_Held',
-        'Avg_Sale_Price', 'Total_Proceeds', 'Current_Price', 'Current_Value',
-        'Difference', 'Difference_Pct',
-    ]].copy()
-    display.columns = [
-        'Symbol', 'Description', 'Orig Shares', 'Split Factor', 'Equiv Shares Today',
-        'Avg Sale Price', 'Total Proceeds', 'Current Price', 'Current Value if Held',
-        'Difference ($)', 'Difference (%)',
-    ]
-else:
-    display = valid[[
-        'Symbol', 'Description', 'Shares_Sold', 'Avg_Sale_Price',
-        'Total_Proceeds', 'Current_Price', 'Current_Value',
-        'Difference', 'Difference_Pct',
-    ]].copy()
-    display.columns = [
-        'Symbol', 'Description', 'Shares Sold', 'Avg Sale Price',
-        'Total Proceeds', 'Current Price', 'Current Value if Held',
-        'Difference ($)', 'Difference (%)',
-    ]
-
-def _color_diff(val):
-    if val > 0:
-        return 'color: #c0392b'   # red — you left gains on the table
-    if val < 0:
-        return 'color: #27ae60'   # green — good timing
+    Older cached pulls have no Symbol column; descriptions look like
+    ``SOLD 100 SHOP AT 65.20``. Take the first uppercase token that is not a
+    keyword.
+    """
+    if not description:
+        return ''
+    for token in description.strip().split():
+        cleaned = re.sub(r'[^A-Z]', '', token.upper())
+        if 1 <= len(cleaned) <= 5 and cleaned not in ('SOLD', 'BOUGHT', 'AT', 'OF', 'FOR'):
+            return cleaned
     return ''
 
 
-fmt = {
-    'Avg Sale Price': '${:,.2f}',
-    'Total Proceeds': '${:,.2f}',
-    'Current Price': '${:,.2f}',
-    'Current Value if Held': '${:,.2f}',
-    'Difference ($)': '${:+,.2f}',
-    'Difference (%)': '{:+.2f}%',
-}
-if has_splits:
-    fmt['Orig Shares'] = '{:,.4g}'
-    fmt['Equiv Shares Today'] = '{:,.4g}'
-    fmt['Split Factor'] = '{:.4g}×'
-else:
-    fmt['Shares Sold'] = '{:,.4g}'
+if run:
+    frame = transactions.copy()
+    frame['Date'] = pd.to_datetime(frame['Date'], errors='coerce')
+    sells = frame[
+        (frame['Category'] == 'Trade')
+        & (frame['Transaction Type'] == 'Sold')
+        & (frame['Date'].dt.date >= start_date)
+        & (frame['Date'].dt.date <= end_date)
+    ].copy()
 
-styled = display.style.map(
-    _color_diff, subset=['Difference ($)', 'Difference (%)']
-).format(fmt, na_rep='N/A')
+    if sells.empty:
+        st.info('No sales in that date range.')
+        st.session_state.pop('wih_result', None)
+        st.stop()
 
-st.dataframe(styled, use_container_width=True, hide_index=True)
+    if 'Symbol' not in sells.columns:
+        sells['Symbol'] = ''
+    missing = sells['Symbol'].isna() | (sells['Symbol'] == '')
+    sells.loc[missing, 'Symbol'] = sells.loc[missing, 'Security Name'].apply(
+        _symbol_from_description)
+    sells = sells[sells['Symbol'].fillna('') != '']
 
-if has_splits:
-    split_syms = valid[valid['Split_Factor'] != 1.0][['Symbol', 'Split_Factor']].copy()
-    notes = ', '.join(
-        f"{row['Symbol']} ({row['Split_Factor']:.4g}×)"
-        for _, row in split_syms.iterrows()
+    if sells.empty:
+        st.warning('Could not identify the ticker for any sale in this range.')
+        st.stop()
+
+    # E*TRADE records sells with a negative quantity; work in magnitudes.
+    sells['Quantity'] = pd.to_numeric(sells['Quantity'], errors='coerce').abs()
+    sells['Total Value'] = pd.to_numeric(sells['Total Value'], errors='coerce').abs()
+
+    tickers = tuple(sorted(sells['Symbol'].unique()))
+    with st.spinner(f'Fetching prices and splits for {len(tickers)} symbol(s)…'):
+        prices = get_current_prices(tickers)
+        splits = get_split_history(tickers)
+
+    # 100 shares sold before a 10:1 split are 1,000 shares today. Without this the
+    # "if held" value is understated by the split ratio.
+    sells['_factor'] = sells.apply(
+        lambda row: cumulative_split_factor(
+            splits.get(row['Symbol'], pd.Series(dtype=float)),
+            pd.Timestamp(row['Date']).date(),
+        ), axis=1,
     )
-    st.caption(
-        f'⚡ Split-adjusted: {notes} — '
-        '"Equiv Shares Today" reflects cumulative stock splits since the sale date. '
-        '"Current Value if Held" uses the adjusted share count.'
-    )
+    sells['_equivalent_shares'] = sells['Quantity'] * sells['_factor']
 
-# ── Bar chart ──────────────────────────────────────────────────────────────────
+    aggregated = sells.groupby('Symbol').agg(
+        Description=('Security Name', 'first'),
+        Shares=('Quantity', 'sum'),
+        Equivalent=('_equivalent_shares', 'sum'),
+        Proceeds=('Total Value', 'sum'),
+        Sales=('Date', 'count'),
+        First=('Date', 'min'),
+        Last=('Date', 'max'),
+    ).reset_index()
+
+    aggregated['Split factor'] = (aggregated['Equivalent'] / aggregated['Shares']).round(4)
+    aggregated['Avg sale price'] = aggregated['Proceeds'] / aggregated['Shares']
+    aggregated['Price now'] = aggregated['Symbol'].map(prices)
+    aggregated['Value if held'] = aggregated['Equivalent'] * aggregated['Price now']
+
+    # Decision value: positive means the sale beat holding.
+    aggregated['Decision $'] = aggregated['Proceeds'] - aggregated['Value if held']
+    aggregated['Decision %'] = aggregated['Decision $'] / aggregated['Proceeds'] * 100
+
+    st.session_state['wih_result'] = aggregated
+
+aggregated = st.session_state.get('wih_result')
+if aggregated is None or aggregated.empty:
+    st.stop()
+
+priced = aggregated[aggregated['Price now'].notna()].copy()
+unpriced = aggregated[aggregated['Price now'].isna()]
+if priced.empty:
+    st.warning('No current prices available for these symbols.')
+    st.stop()
+
+# ── Headline ──────────────────────────────────────────────────────────────────
+
+proceeds = priced['Proceeds'].sum()
+if_held = priced['Value if held'].sum()
+decision_dollars = proceeds - if_held
+decision_pct = decision_dollars / proceeds * 100 if proceeds else 0
 
 st.markdown('---')
-st.markdown('### By Symbol')
 
-chart_df = valid[['Symbol', 'Difference']].sort_values('Difference')
-chart_df['Color'] = chart_df['Difference'].apply(
-    lambda v: 'Left on table' if v > 0 else 'Good timing'
+k1, k2, k3 = st.columns([2, 1, 1])
+# No st.metric delta here: its arrow always points up for a text delta, which on a
+# negative result contradicted the number right above it.
+k1.metric('Selling vs holding', percent(decision_pct, signed=True))
+k1.caption(
+    f'**{"Selling came out ahead" if decision_dollars >= 0 else "Holding would have won"}** '
+    f'by {money(abs(decision_dollars), 0)} across {len(priced)} symbol(s).'
 )
+k2.metric('Proceeds received', money(proceeds, 0))
+k3.metric('Worth today if held', money(if_held, 0))
 
-fig = px.bar(
-    chart_df,
-    x='Symbol',
-    y='Difference',
-    color='Color',
-    color_discrete_map={'Left on table': '#e74c3c', 'Good timing': '#2ecc71'},
-    labels={'Difference': 'Difference ($)', 'Symbol': ''},
-    text=chart_df['Difference'].apply(lambda v: f'${v:+,.0f}'),
+if not unpriced.empty:
+    st.caption(
+        f'No current price for {", ".join(unpriced["Symbol"])} — delisted, renamed, or '
+        'not covered by the price source. Excluded from every figure above.'
+    )
+
+st.markdown('---')
+
+# ── Chart ─────────────────────────────────────────────────────────────────────
+
+st.markdown('##### By symbol')
+
+# A 2% swing is noise on a position sold months ago; painting it green or red
+# implies a signal that is not there.
+NEUTRAL_BAND = 2.0
+
+chart = priced.sort_values('Decision %').copy()
+chart['Label'] = chart['Decision %'].map(lambda v: f'{v:+.1f}%')
+
+fig = px.bar(chart, x='Symbol', y='Decision %', text='Label',
+             custom_data=['Proceeds', 'Value if held', 'Decision $'])
+fig.update_traces(
+    marker_color=theme.signed_colours(chart['Decision %'], colours, NEUTRAL_BAND),
+    marker_cornerradius=4,
+    marker_line_color=colours['surface'], marker_line_width=2,
+    textposition='outside', cliponaxis=False,
+    hovertemplate=(
+        '<b>%{x}</b><br>Sold for $%{customdata[0]:,.0f}<br>'
+        'Worth $%{customdata[1]:,.0f} today<br>'
+        'Difference $%{customdata[2]:,.0f} (%{y:+.1f}%)<extra></extra>'
+    ),
 )
-fig.update_traces(textposition='outside')
-fig.add_hline(y=0, line_dash='dash', line_color='grey', line_width=1)
-fig.update_layout(
-    showlegend=True,
-    legend_title_text='',
-    margin=dict(t=20, b=20),
-    yaxis_tickprefix='$',
-    yaxis_tickformat=',.0f',
-)
+theme.apply_layout(fig, colours, y_suffix='%')
+fig.add_hline(y=0, line_width=1, line_color=colours['reference'])
+span = max(chart['Decision %'].abs().max(), 1) * 1.25
+fig.update_layout(height=380, xaxis_title=None, yaxis_title=None, showlegend=False)
+fig.update_yaxes(range=[-span, span])
 st.plotly_chart(fig, use_container_width=True)
 
-# ── Sell transaction detail ────────────────────────────────────────────────────
+st.caption(
+    f'Above the line: selling was the better call. Below: holding would have won. '
+    f'Grey marks are within ±{NEUTRAL_BAND:.0f}%, too close to call.'
+)
 
-with st.expander('View individual sell transactions'):
-    raw_sells = st.session_state.get('portfolio', {}).get('transactions', pd.DataFrame())
-    if not raw_sells.empty:
-        df_raw = raw_sells.copy()
-        if not pd.api.types.is_datetime64_any_dtype(df_raw['Date']):
-            df_raw['Date'] = pd.to_datetime(df_raw['Date'], errors='coerce')
-        mask = (
-            (df_raw['Category'] == 'Trade') &
-            (df_raw['Transaction Type'] == 'Sold') &
-            (df_raw['Date'].dt.date >= start_date) &
-            (df_raw['Date'].dt.date <= end_date)
-        )
-        detail = df_raw[mask][['Date', 'Security Name', 'Quantity', 'Price', 'Total Value']].copy()
-        detail['Date'] = detail['Date'].dt.date
-        st.dataframe(detail, use_container_width=True, hide_index=True)
+st.markdown('---')
+
+# ── Table ─────────────────────────────────────────────────────────────────────
+
+st.markdown('##### Detail')
+
+has_splits = (priced['Split factor'] != 1.0).any()
+columns = ['Symbol', 'Decision %', 'Decision $', 'Shares']
+if has_splits:
+    columns += ['Split factor', 'Equivalent']
+columns += ['Avg sale price', 'Proceeds', 'Price now', 'Value if held', 'Sales']
+
+table = priced.sort_values('Decision %', ascending=False)[columns].rename(columns={
+    'Decision %': 'Decision (%)', 'Decision $': 'Decision ($)',
+    'Shares': 'Shares sold', 'Equivalent': 'Shares today',
+    'Proceeds': 'Total proceeds', 'Value if held': 'Worth today',
+})
+
+
+def _percent_ink(value):
+    """Match the chart: neutral inside the band, otherwise coloured by sign."""
+    if pd.isna(value):
+        return ''
+    if abs(value) <= NEUTRAL_BAND:
+        return f'color: {colours["neutral"]}'
+    return f'color: {colours["positive"] if value > 0 else colours["negative"]}'
+
+
+def _dollar_ink(value):
+    """Dollars have no meaningful noise band — colour purely by sign."""
+    if pd.isna(value) or value == 0:
+        return ''
+    return f'color: {colours["positive"] if value > 0 else colours["negative"]}'
+
+
+st.dataframe(
+    table.style
+    .map(_percent_ink, subset=['Decision (%)'])
+    .map(_dollar_ink, subset=['Decision ($)'])
+    .format({
+        'Decision (%)': '{:+.2f}%',
+        'Decision ($)': lambda v: signed_money(v, 0),
+        'Shares sold': '{:,.4g}', 'Shares today': '{:,.4g}', 'Split factor': '{:.4g}×',
+        'Avg sale price': '${:,.2f}', 'Total proceeds': '${:,.0f}',
+        'Price now': '${:,.2f}', 'Worth today': '${:,.0f}',
+    }, na_rep='—'),
+    use_container_width=True, hide_index=True,
+)
+
+if has_splits:
+    split_note = ', '.join(
+        f'{row["Symbol"]} ({row["Split factor"]:.4g}×)'
+        for _, row in priced[priced['Split factor'] != 1.0].iterrows()
+    )
+    st.caption(
+        f'⚡ Split-adjusted: {split_note}. Shares today reflects splits since the sale, '
+        'so "worth today" compares like with like.'
+    )

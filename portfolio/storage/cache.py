@@ -1,67 +1,134 @@
+"""
+On-disk cache of the last successful refresh.
+
+Lets the dashboard open with data instead of an empty page, and lets you browse
+without re-authenticating to E*TRADE. Local only — this is real holdings data and
+the repo is public.
+
+The whole portfolio dict round-trips: DataFrames become records, numpy scalars
+become Python numbers, and NaN becomes null. Anything that will not serialise
+raises here rather than silently writing a half-file, so the caller can report it.
+"""
+
 import json
+import logging
+
+import numpy as np
 import pandas as pd
 
 from portfolio import paths
 
-_DATA_DIR = paths.DATA_DIR
-_CACHE_FILE = _DATA_DIR / 'portfolio_cache.json'
+LOGGER = logging.getLogger(__name__)
 
-_DATE_COLS = {'Date', 'Date Acquired'}
+CACHE_FILE = paths.DATA_DIR / 'portfolio_cache.json'
 
+#: Portfolio keys that hold DataFrames and need reconstructing on load.
+FRAME_KEYS = ('holdings', 'transactions', 'cash_flows', 'income')
 
-def save_portfolio(holdings_df, transactions_df, cash_flows_df, income_df, analytics_report, summary, fetched_at):
-    _DATA_DIR.mkdir(exist_ok=True)
-    cache = {
-        'fetched_at': fetched_at,
-        'holdings': _df_to_records(holdings_df),
-        'transactions': _df_to_records(transactions_df),
-        'cash_flows': _df_to_records(cash_flows_df),
-        'income': _df_to_records(income_df),
-        'analytics_report': _make_serialisable(analytics_report or {}),
-        'summary': _make_serialisable(summary or {}),
-    }
-    with open(_CACHE_FILE, 'w') as f:
-        json.dump(cache, f, indent=2)
+#: Columns parsed back to datetimes. Everything else is coerced to numeric when
+#: it will convert cleanly, and left as text when it will not.
+_DATE_COLUMNS = {'Date', 'Date Acquired', 'First', 'Last'}
+
+#: Columns that must stay text even though they look numeric. Account and REFID
+#: digits would otherwise become floats and lose their leading zeros — and
+#: ``'1607'`` becoming ``1607.0`` breaks every counterparty lookup.
+_TEXT_COLUMNS = {'Symbol', 'Ref ID', 'Counterparty', 'Account', 'Category',
+                 'Transaction Type', 'Classification Note'}
 
 
-def load_portfolio():
-    if not _CACHE_FILE.exists():
+def save_portfolio(portfolio: dict) -> None:
+    """Write the portfolio dict to disk, raising if it cannot be serialised."""
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(to_jsonable(portfolio), indent=2))
+    LOGGER.debug('portfolio cached to %s', CACHE_FILE)
+
+
+def load_portfolio() -> dict | None:
+    """Read the cached portfolio, or None when there is no usable cache."""
+    if not CACHE_FILE.exists():
         return None
-    with open(_CACHE_FILE) as f:
-        cache = json.load(f)
-    cache['holdings'] = _records_to_df(cache.get('holdings', []))
-    cache['transactions'] = _records_to_df(cache.get('transactions', []))
-    cache['cash_flows'] = _records_to_df(cache.get('cash_flows', []))
-    cache['income'] = _records_to_df(cache.get('income', []))
-    return cache
+    try:
+        return _migrate(from_jsonable(json.loads(CACHE_FILE.read_text())))
+    except (json.JSONDecodeError, OSError) as exc:
+        LOGGER.warning('portfolio cache unreadable (%s); ignoring it', exc)
+        return None
 
 
-def _df_to_records(df):
-    if df is None or (hasattr(df, 'empty') and df.empty):
-        return []
-    return json.loads(df.to_json(orient='records', date_format='iso', default_handler=str))
+def _migrate(portfolio: dict) -> dict:
+    """
+    Accept caches written before frames were tagged with ``__frame__``.
+
+    Those stored each frame as a bare list of records, which :func:`from_jsonable`
+    leaves as a list. Rebuilding them here means an existing cache keeps working
+    across the upgrade instead of the dashboard opening empty.
+    """
+    for key in FRAME_KEYS:
+        value = portfolio.get(key)
+        if isinstance(value, list):
+            portfolio[key] = records_to_frame(value)
+        elif value is None:
+            portfolio[key] = pd.DataFrame()
+    return portfolio
 
 
-def _records_to_df(records):
+# ── Serialisation ─────────────────────────────────────────────────────────────
+
+def to_jsonable(obj):
+    """
+    Convert a portfolio dict into something ``json.dumps`` accepts.
+
+    numpy scalars need explicit handling: ``np.float64`` happens to subclass
+    ``float`` and serialises by luck, but ``np.int64`` does not subclass ``int``
+    and raises. Counting on that distinction is how a cache write starts failing
+    the day an integer metric is added.
+    """
+    if isinstance(obj, pd.DataFrame):
+        return {'__frame__': json.loads(obj.to_json(orient='records', date_format='iso'))}
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(obj).isoformat()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        value = float(obj)
+        return None if pd.isna(value) else value
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, float) and pd.isna(obj):
+        return None
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    return str(obj)
+
+
+def from_jsonable(obj):
+    """Reverse :func:`to_jsonable`, restoring DataFrames and their dtypes."""
+    if isinstance(obj, dict):
+        if set(obj) == {'__frame__'}:
+            return records_to_frame(obj['__frame__'])
+        return {k: from_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [from_jsonable(v) for v in obj]
+    return obj
+
+
+def records_to_frame(records) -> pd.DataFrame:
+    """Rebuild a DataFrame from records, restoring dates and numeric columns."""
     if not records:
         return pd.DataFrame()
-    df = pd.DataFrame(records)
-    for col in df.columns:
-        if col in _DATE_COLS:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
+    frame = pd.DataFrame(records)
+    for column in frame.columns:
+        if column in _DATE_COLUMNS:
+            frame[column] = pd.to_datetime(frame[column], errors='coerce')
+        elif column in _TEXT_COLUMNS:
+            frame[column] = frame[column].astype('object')
         else:
-            try:
-                df[col] = pd.to_numeric(df[col])
-            except (ValueError, TypeError):
-                pass
-    return df
-
-
-def _make_serialisable(obj):
-    if isinstance(obj, dict):
-        return {k: _make_serialisable(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_make_serialisable(v) for v in obj]
-    if isinstance(obj, float) and obj != obj:
-        return None
-    return obj
+            converted = pd.to_numeric(frame[column], errors='coerce')
+            # Only accept the conversion when it loses nothing; otherwise a
+            # mostly-text column would be blanked into NaNs.
+            if converted.notna().sum() >= frame[column].notna().sum():
+                frame[column] = converted
+    return frame

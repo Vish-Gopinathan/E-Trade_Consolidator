@@ -4,7 +4,7 @@ Daily portfolio value reconstructed from transaction history.
 E*TRADE reports only the portfolio as it stands today. This page rebuilds what it
 was worth at the close of every day by walking share counts backwards from
 today's holdings through the transaction feed and valuing them with daily closes.
-See lib/portfolio_history.py for the methodology.
+See portfolio/history.py for the methodology.
 """
 
 import json
@@ -14,38 +14,24 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
-from ui.common import require_auth, render_sidebar_status, is_guest
+from ui.common import is_guest, page_header, require_portfolio, signed_money
 from portfolio.storage import prices as ps
 from portfolio import symbols as sr
 from portfolio import history as ph
 from ui import theme as vt
 from portfolio import paths
 
-st.set_page_config(page_title='Portfolio History', page_icon='📈', layout='wide')
-require_auth()
-
-with st.sidebar:
-    st.title('📈 Portfolio')
-    render_sidebar_status()
-
-st.title('📈 Portfolio Value Over Time')
-st.caption(
-    'End-of-day value for every trading day, rebuilt from your transaction history. '
-    'Share counts are walked backwards from today\'s holdings, so the most recent '
-    'figures are exact and any gap in the transaction feed surfaces as a residual '
-    'in the earliest dates — see **Data quality** below.'
+page_header(
+    'Portfolio Value Over Time', '📉',
+    "End-of-day value for every trading day, rebuilt from your transaction history. "
+    "Share counts are walked backwards from today's holdings, so the most recent "
+    "figures are exact and any gap in the transaction feed surfaces as a residual "
+    "in the earliest dates — see **Data quality** below.",
 )
 
-portfolio = st.session_state.get('portfolio')
-if not portfolio:
-    st.warning('No data loaded. Go to the home page and refresh.')
-    st.stop()
-
-transactions_df = portfolio.get('transactions')
+portfolio = require_portfolio()
+transactions_df = require_portfolio('transactions')
 holdings_df = portfolio.get('holdings')
-if transactions_df is None or transactions_df.empty:
-    st.info('No transaction data available. Refresh data from the home page.')
-    st.stop()
 
 anchor = ph.anchor_date(portfolio)
 
@@ -323,7 +309,7 @@ else:
     st.dataframe(
         table.style.format({
             'Value at start': '${:,.0f}', 'Value at end': '${:,.0f}',
-            'Change': '${:+,.0f}', 'Share of portfolio': '{:.1f}%',
+            'Change': lambda v: signed_money(v, 0), 'Share of portfolio': '{:.1f}%',
         }),
         use_container_width=True, hide_index=True,
     )
@@ -353,7 +339,7 @@ daily['Day change'] = daily['Total'].diff()
 st.dataframe(
     daily.iloc[::-1].style.format({
         'Positions': '${:,.2f}', 'Cash': '${:,.2f}', 'Total': '${:,.2f}',
-        'Net deposits (cumulative)': '${:,.2f}', 'Day change': '${:+,.2f}',
+        'Net deposits (cumulative)': '${:,.2f}', 'Day change': signed_money,
     }, na_rep='—'),
     use_container_width=True, hide_index=True, height=320,
 )

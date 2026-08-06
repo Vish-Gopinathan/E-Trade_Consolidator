@@ -1,14 +1,30 @@
 """
-Persistent earnings store.
+Persistent earnings store: past quarters and the next expected report date.
 
-Stores past quarters (static — never change) and the upcoming date (refreshed
-weekly). Data source: yfinance. Persistence is local disk only: this file holds
-real holdings-derived data and the repo is public, so it is never pushed to a
-remote. On an ephemeral host the store simply rebuilds on first page load.
+Past quarters never change once reported, so they are written once and kept.
+Only the upcoming date is re-fetched, weekly. Persistence is local disk only —
+this file is derived from real holdings and the repo is public, so it is never
+pushed to a remote. On an ephemeral host the store rebuilds on first page load.
+
+**Why the data sources are ordered the way they are.** ``Ticker.earnings_history``
+and ``Ticker.calendar`` are JSON endpoints; ``Ticker.get_earnings_dates`` scrapes
+an HTML table through ``pandas.read_html`` and raises ``ImportError`` when lxml is
+missing. That import error was caught into ``_error`` and every symbol stored
+empty earnings — which is why EPS never populated and history was always blank.
+The JSON endpoints are now primary and always sufficient; ``get_earnings_dates``
+is a bonus that supplies true announcement dates when lxml is installed.
+
+**Quarter end is not report date.** ``earnings_history`` is indexed by fiscal
+quarter end (NVDA's quarter ending 2026-04-30 was reported on 2026-05-27, four
+weeks later). Rows carry ``date_is_report_date`` so the UI can label the column
+honestly, and the price reaction is computed only when a real announcement date is
+known — measuring a one-day move around the wrong day is worse than showing
+nothing.
 """
 
 import json
-import time
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 import pandas as pd
@@ -16,182 +32,320 @@ import yfinance as yf
 
 from portfolio import paths
 
+LOGGER = logging.getLogger(__name__)
+
+# ETFs and trusts have no fundamentals, so yfinance logs a 404 for each one on
+# every refresh. That is an expected outcome here, not a fault — the symbol is
+# simply reported as having no earnings — so keep it out of the console.
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+
 STORE_PATH = paths.DATA_DIR / 'earnings_store.json'
-_STALENESS_DAYS = 7  # refresh upcoming dates weekly
+
+_STALENESS_DAYS = 7   # upcoming dates drift; past quarters never do
+_MAX_QUARTERS = 8     # kept per symbol
+_MAX_WORKERS = 6      # yfinance tolerates this comfortably; higher starts throttling
+_NEVER = '2000-01-01'
 
 
 # ── Disk I/O ──────────────────────────────────────────────────────────────────
 
 def load() -> dict:
-    if STORE_PATH.exists():
-        try:
-            return json.loads(STORE_PATH.read_text())
-        except Exception:
-            return {}
-    return {}
-
-
-def _write_disk(store: dict):
-    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STORE_PATH.write_text(json.dumps(store, indent=2))
-
-
-def save(store: dict):
-    """Write the store to disk. Local only — never to a remote."""
-    _write_disk(store)
-
-
-# ── Price reaction helper ─────────────────────────────────────────────────────
-
-def _price_reaction(ticker, earnings_date: date) -> float | None:
+    """Return the stored data, or an empty dict when there is none."""
+    if not STORE_PATH.exists():
+        return {}
     try:
-        start = pd.Timestamp(earnings_date) - pd.Timedelta(days=7)
-        end = pd.Timestamp(earnings_date) + pd.Timedelta(days=7)
-        hist = ticker.history(start=start, end=end)
-        if hist.empty:
-            return None
-        if hist.index.tz is not None:
-            hist.index = hist.index.tz_localize(None)
-        ts = pd.Timestamp(earnings_date)
-        before = hist[hist.index <= ts]
-        after = hist[hist.index > ts]
-        if before.empty or after.empty:
-            return None
-        p0 = float(before['Close'].iloc[-1])
-        p1 = float(after['Close'].iloc[0])
-        return round((p1 - p0) / p0 * 100, 2) if p0 else None
-    except Exception:
-        return None
+        return json.loads(STORE_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        LOGGER.warning('earnings store unreadable (%s); starting fresh', exc)
+        return {}
+
+
+def save(store: dict) -> None:
+    """Write the store to disk. Local only — never to a remote."""
+    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STORE_PATH.write_text(json.dumps(store, indent=2, sort_keys=True))
 
 
 # ── Per-symbol fetch ──────────────────────────────────────────────────────────
 
 def fetch_symbol(symbol: str, existing: dict | None = None) -> dict:
     """
-    Fetch earnings for one symbol from yfinance.
-    Merges with `existing` to preserve already-stored past quarters (they never change).
-    Only marks last_updated when data is actually retrieved — failed fetches are
-    left with last_updated='2000-01-01' so they are retried on next page load.
-    """
-    today = date.today()
-    # Start with old last_updated so a failed fetch doesn't cache itself as fresh
-    old_last_updated = (existing or {}).get('last_updated', '2000-01-01')
-    result: dict = {'last_updated': old_last_updated, 'upcoming': None, 'recent': [], '_error': None}
+    Fetch one symbol's earnings, merged with what is already stored.
 
-    # Carry forward past quarters from existing store
-    past_dates: set = set()
-    if existing and existing.get('recent'):
-        result['recent'] = list(existing['recent'])
-        past_dates = {r['date'] for r in result['recent']}
+    Already-known quarters are preserved rather than re-fetched. ``last_updated``
+    advances only when something was actually retrieved, so a failed fetch is
+    retried on the next page load instead of caching itself as fresh.
+    """
+    existing = existing or {}
+    result = {
+        'last_updated': existing.get('last_updated', _NEVER),
+        'upcoming': None,
+        'recent': list(existing.get('recent', [])),
+        '_error': None,
+    }
+    known_quarters = {row.get('quarter') or row.get('date') for row in result['recent']}
 
     ticker = yf.Ticker(symbol)
+    errors = []
 
-    # ── earnings_dates (primary source) ──────────────────────────────────────
+    # ── Past quarters: JSON, always available ─────────────────────────────────
     try:
-        dates_df = ticker.get_earnings_dates(limit=16)
-        if dates_df is not None and not dates_df.empty:
-            upcoming_candidates: list = []
-
-            for dt_idx, row in dates_df.iterrows():
-                try:
-                    dt = dt_idx.date()  # timezone-safe: works for both tz-aware and naive
-                except Exception:
-                    continue
-
-                eps_act = row.get('Reported EPS')
-                eps_est = row.get('EPS Estimate')
-                surprise = row.get('Surprise(%)')
-
-                if dt >= today:
-                    upcoming_candidates.append((dt, eps_est))
-                elif dt.isoformat() not in past_dates:
-                    if pd.isna(eps_act) and pd.isna(eps_est):
-                        continue
-                    surprise_val = float(surprise) if pd.notna(surprise) else None
-                    if (surprise_val is None
-                            and pd.notna(eps_act) and pd.notna(eps_est)
-                            and float(eps_est) != 0):
-                        surprise_val = round(
-                            (float(eps_act) - float(eps_est)) / abs(float(eps_est)) * 100, 2
-                        )
-                    price_chg = _price_reaction(ticker, dt)
-                    result['recent'].append({
-                        'date': dt.isoformat(),
-                        'eps_actual': float(eps_act) if pd.notna(eps_act) else None,
-                        'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
-                        'surprise_pct': surprise_val,
-                        'price_chg_pct': price_chg,
-                    })
-                    past_dates.add(dt.isoformat())
-
-            result['recent'].sort(key=lambda x: x['date'], reverse=True)
-            result['recent'] = result['recent'][:8]
-
-            if upcoming_candidates:
-                upcoming_candidates.sort(key=lambda x: x[0])
-                dt, eps_est = upcoming_candidates[0]
-                result['upcoming'] = {
-                    'date': dt.isoformat(),
-                    'eps_estimate': float(eps_est) if pd.notna(eps_est) else None,
-                }
+        for row in _quarters_from_history(ticker):
+            if row['quarter'] not in known_quarters:
+                result['recent'].append(row)
+                known_quarters.add(row['quarter'])
     except Exception as exc:
-        result['_error'] = f'get_earnings_dates: {exc}'
+        errors.append(f'earnings_history: {exc}')
 
-    # ── calendar fallback for upcoming ───────────────────────────────────────
-    if result['upcoming'] is None:
-        try:
-            cal = ticker.calendar
-            if cal is not None:
-                # calendar can be a dict (new yfinance) or a DataFrame (old)
-                if isinstance(cal, dict):
-                    raw_dates = cal.get('Earnings Date') or []
-                    if raw_dates:
-                        raw = raw_dates[0] if isinstance(raw_dates, list) else raw_dates
-                        dt = pd.Timestamp(raw).date() if not isinstance(raw, date) else raw
-                        if dt >= today:
-                            result['upcoming'] = {'date': dt.isoformat(), 'eps_estimate': None}
-                else:
-                    for key in ('Earnings Date', 'earnings_date'):
-                        if hasattr(cal, 'index') and key in cal.index:
-                            val = cal.loc[key]
-                            raw = val.iloc[0] if hasattr(val, 'iloc') else val
-                            if pd.notna(raw):
-                                dt = pd.Timestamp(raw).date()
-                                if dt >= today:
-                                    result['upcoming'] = {
-                                        'date': dt.isoformat(),
-                                        'eps_estimate': None,
-                                    }
-                                    break
-        except Exception as exc:
-            if not result['_error']:
-                result['_error'] = f'calendar: {exc}'
+    # ── Announcement dates: HTML scrape, needs lxml. Enrichment only ──────────
+    try:
+        _apply_announcement_dates(ticker, result['recent'])
+    except ImportError:
+        LOGGER.debug('%s: lxml missing, using quarter-end dates', symbol)
+    except Exception as exc:
+        LOGGER.debug('%s: earnings dates unavailable (%s)', symbol, exc)
 
-    # Only stamp last_updated when we actually got something useful
+    result['recent'].sort(key=lambda row: row['date'], reverse=True)
+    result['recent'] = result['recent'][:_MAX_QUARTERS]
+
+    # ── Price reaction: one price history for every quarter at once ───────────
+    try:
+        _apply_price_reactions(ticker, result['recent'])
+    except Exception as exc:
+        LOGGER.debug('%s: price reactions unavailable (%s)', symbol, exc)
+
+    # ── Upcoming ──────────────────────────────────────────────────────────────
+    try:
+        result['upcoming'] = _upcoming_from_calendar(ticker)
+    except Exception as exc:
+        errors.append(f'calendar: {exc}')
+
     if result['recent'] or result['upcoming']:
-        result['last_updated'] = today.isoformat()
-
+        result['last_updated'] = date.today().isoformat()
+    if errors:
+        result['_error'] = '; '.join(errors)
     return result
+
+
+def _quarters_from_history(ticker) -> list:
+    """
+    Past quarters from ``Ticker.earnings_history``.
+
+    Columns are ``epsActual``, ``epsEstimate``, ``epsDifference`` and
+    ``surprisePercent``. **surprisePercent is a fraction**: 0.0410 means +4.10%,
+    so it is scaled here rather than displayed as 0.04%.
+    """
+    history = ticker.earnings_history
+    if history is None or history.empty:
+        return []
+
+    rows = []
+    for index, record in history.iterrows():
+        try:
+            quarter_end = pd.Timestamp(index).date()
+        except (TypeError, ValueError):
+            continue
+
+        actual = _number(record.get('epsActual'))
+        estimate = _number(record.get('epsEstimate'))
+        if actual is None and estimate is None:
+            continue
+
+        surprise = _number(record.get('surprisePercent'))
+        if surprise is not None:
+            surprise = round(surprise * 100, 2)
+        elif actual is not None and estimate:
+            surprise = round((actual - estimate) / abs(estimate) * 100, 2)
+
+        rows.append({
+            'quarter': quarter_end.isoformat(),
+            'date': quarter_end.isoformat(),   # replaced if a report date is found
+            'date_is_report_date': False,
+            'eps_actual': actual,
+            'eps_estimate': estimate,
+            'surprise_pct': surprise,
+            'price_chg_pct': None,
+        })
+    return rows
+
+
+def _apply_announcement_dates(ticker, quarters: list) -> None:
+    """
+    Upgrade quarter-end dates to real announcement dates where possible.
+
+    Needs lxml. Each announcement is matched to the quarter it reports on: the
+    report follows quarter end by roughly a month, so the nearest quarter within
+    100 days before the announcement is the right one.
+    """
+    if not quarters:
+        return
+    reported = ticker.get_earnings_dates(limit=16)
+    if reported is None or reported.empty:
+        return
+
+    announcements = []
+    for index, _ in reported.iterrows():
+        try:
+            announcements.append(pd.Timestamp(index).date())
+        except (TypeError, ValueError):
+            continue
+
+    for row in quarters:
+        quarter_end = date.fromisoformat(row['quarter'])
+        candidates = [
+            announced for announced in announcements
+            if 0 <= (announced - quarter_end).days <= 100
+        ]
+        if candidates:
+            row['date'] = min(candidates).isoformat()
+            row['date_is_report_date'] = True
+
+
+def _apply_price_reactions(ticker, quarters: list) -> None:
+    """
+    Fill in the one-day move around each report.
+
+    One ``history`` call covers every quarter. The old code fetched a two-week
+    window per quarter per symbol — roughly 170 requests for a 21-symbol
+    portfolio, which is what made the page slow.
+
+    Skipped for rows whose date is a quarter end rather than an announcement:
+    the price move around the wrong day is a misleading number, not a rough one.
+    """
+    datable = [row for row in quarters if row.get('date_is_report_date')]
+    if not datable:
+        return
+
+    earliest = min(date.fromisoformat(row['date']) for row in datable)
+    prices = ticker.history(
+        start=pd.Timestamp(earliest) - pd.Timedelta(days=10),
+        end=pd.Timestamp(date.today()) + pd.Timedelta(days=1),
+        auto_adjust=True,
+    )
+    if prices.empty:
+        return
+    if prices.index.tz is not None:
+        prices.index = prices.index.tz_localize(None)
+    closes = prices['Close']
+
+    for row in datable:
+        stamp = pd.Timestamp(date.fromisoformat(row['date']))
+        before = closes[closes.index <= stamp]
+        after = closes[closes.index > stamp]
+        if before.empty or after.empty:
+            continue
+        opening, closing = float(before.iloc[-1]), float(after.iloc[0])
+        if opening:
+            row['price_chg_pct'] = round((closing - opening) / opening * 100, 2)
+
+
+def _upcoming_from_calendar(ticker) -> dict | None:
+    """
+    Next expected report date, with the consensus EPS estimate.
+
+    ``calendar['Earnings Average']`` is the analyst consensus. The previous
+    version hardcoded the estimate to None, which is why the Upcoming table's EPS
+    column was always empty even when the date was right.
+    """
+    calendar = ticker.calendar
+    if not calendar:
+        return None
+
+    if isinstance(calendar, dict):
+        raw_dates = calendar.get('Earnings Date') or []
+        raw = raw_dates[0] if isinstance(raw_dates, list) and raw_dates else raw_dates
+        estimate = _number(calendar.get('Earnings Average'))
+    else:  # older yfinance returned a DataFrame
+        if not hasattr(calendar, 'index') or 'Earnings Date' not in calendar.index:
+            return None
+        value = calendar.loc['Earnings Date']
+        raw = value.iloc[0] if hasattr(value, 'iloc') else value
+        estimate = None
+
+    if raw is None or (isinstance(raw, list) and not raw):
+        return None
+    try:
+        upcoming = raw if isinstance(raw, date) else pd.Timestamp(raw).date()
+    except (TypeError, ValueError):
+        return None
+
+    if upcoming < date.today():
+        return None
+    return {'date': upcoming.isoformat(), 'eps_estimate': estimate}
+
+
+def _number(value) -> float | None:
+    """Coerce a yfinance cell to float, treating NaN and blanks as missing."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(number) else number
 
 
 # ── Batch refresh ─────────────────────────────────────────────────────────────
 
-def refresh(symbols: list, store: dict, force: bool = False) -> tuple:
-    """
-    Fetch any symbols that are missing or stale (> _STALENESS_DAYS old).
-    Returns (updated_store, list_of_symbols_actually_fetched).
-    """
+def stale_symbols(symbols, store: dict) -> list:
+    """Symbols missing from the store or older than the staleness window."""
     today = date.today()
+    outdated = []
+    for symbol in symbols:
+        entry = store.get(symbol)
+        if not entry:
+            outdated.append(symbol)
+            continue
+        try:
+            last = date.fromisoformat(entry.get('last_updated', _NEVER))
+        except ValueError:
+            last = date.fromisoformat(_NEVER)
+        if (today - last).days >= _STALENESS_DAYS:
+            outdated.append(symbol)
+    return outdated
+
+
+def refresh(symbols, store: dict, force: bool = False, on_progress=None) -> tuple:
+    """
+    Fetch missing or stale symbols in parallel and persist as results arrive.
+
+    Writing after every symbol matters: the first run for a 21-symbol portfolio
+    takes long enough that a user may navigate away, and an all-or-nothing write
+    would mean starting over.
+
+    Args:
+        on_progress: Called as ``(done, total, symbol)`` after each symbol, for
+            a progress bar.
+
+    Returns:
+        ``(store, fetched_symbols)``.
+    """
+    targets = list(symbols) if force else stale_symbols(symbols, store)
+    if not targets:
+        return store, []
+
     fetched = []
-    for sym in symbols:
-        existing = store.get(sym)
-        if existing:
-            last = date.fromisoformat(existing.get('last_updated', '2000-01-01'))
-            stale = (today - last).days >= _STALENESS_DAYS
-        else:
-            stale = True
-        if force or stale:
-            store[sym] = fetch_symbol(sym, existing)
-            fetched.append(sym)
-            time.sleep(0.3)
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        results = pool.map(lambda s: (s, _safe_fetch(s, store.get(s))), targets)
+        for done, (symbol, entry) in enumerate(results, start=1):
+            store[symbol] = entry
+            fetched.append(symbol)
+            save(store)
+            if on_progress:
+                on_progress(done, len(targets), symbol)
+
     return store, fetched
+
+
+def _safe_fetch(symbol: str, existing: dict | None) -> dict:
+    """Never let one bad symbol abort the batch; record the error on the entry."""
+    try:
+        return fetch_symbol(symbol, existing)
+    except Exception as exc:
+        LOGGER.warning('earnings fetch failed for %s: %s', symbol, exc)
+        entry = dict(existing or {})
+        entry.setdefault('recent', [])
+        entry.setdefault('upcoming', None)
+        entry['last_updated'] = entry.get('last_updated', _NEVER)
+        entry['_error'] = str(exc)
+        return entry
