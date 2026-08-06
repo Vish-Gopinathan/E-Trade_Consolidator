@@ -1,153 +1,135 @@
-import os
+"""
+Batch export from the terminal.
+
+Pulls holdings and transactions for a date range and writes two Excel workbooks.
+The dashboard (``streamlit run app.py``) does the same work interactively; this
+entry point exists for scripted or scheduled runs.
+
+    python cli.py --start 2024-01-01 --output-dir outputs/
+"""
+
 import argparse
 import datetime
-from portfolio.etrade import (
-    authenticate_etrade,
-    fetch_active_accounts,
-    get_portfolio,
-    get_cash_balance,
-    consolidate_holdings,
-    portfolio_summary,
-    export_to_excel,
-    get_all_consolidated_transactions,
-    get_cash_flows
-)
-from portfolio.analytics import PortfolioAnalytics, export_analytics_to_excel
+import logging
+import os
+
+import pandas as pd
+
+from portfolio import analytics, classify, etrade, excel, schema
+from portfolio.storage import accounts as account_map_store
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='E*TRADE Portfolio Consolidator & Analytics')
+    parser = argparse.ArgumentParser(description='E*TRADE portfolio consolidator and analytics')
     parser.add_argument(
-        '--start',
-        type=lambda s: datetime.date.fromisoformat(s),
-        default=datetime.date(datetime.date.today().year, 1, 1),
-        metavar='YYYY-MM-DD',
-        help='Start date for transaction history (default: Jan 1 of current year)'
+        '--start', type=datetime.date.fromisoformat, metavar='YYYY-MM-DD',
+        default=datetime.date(2000, 1, 1),
+        help='Start of transaction history. The default reaches back past account '
+             'opening, which is what makes the deposit-adjusted return meaningful.',
     )
     parser.add_argument(
-        '--end',
-        type=lambda s: datetime.date.fromisoformat(s),
-        default=datetime.date.today(),
-        metavar='YYYY-MM-DD',
-        help='End date for transaction history (default: today)'
+        '--end', type=datetime.date.fromisoformat, metavar='YYYY-MM-DD',
+        default=datetime.date.today(), help='End of transaction history (default: today)',
     )
     parser.add_argument(
-        '--output-dir',
-        default='.',
-        metavar='DIR',
-        help='Directory to write output Excel files (default: current directory)'
+        '--output-dir', default='.', metavar='DIR',
+        help='Where to write the Excel files (default: current directory)',
+    )
+    parser.add_argument(
+        '--verbose', action='store_true',
+        help='Log every transaction classification decision',
     )
     return parser.parse_args()
 
 
 def main():
-    """
-    Main orchestrator - runs consolidator then analytics.
-    """
-    import pandas as pd
-
     args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format='%(levelname)s %(name)s: %(message)s',
+    )
 
+    print('Authenticating with E*TRADE...')
+    auth_tokens = etrade.authenticate_etrade()
+
+    print('Fetching accounts and positions...')
+    active_accounts, accounts_obj = etrade.fetch_active_accounts(auth_tokens)
+
+    frames, total_cash, total_value = [], 0.0, 0.0
+    for key in active_accounts['accountIdKey']:
+        frames.append(etrade.get_portfolio(accounts_obj, key))
+        totals = etrade.get_account_totals(accounts_obj, key)
+        total_cash += totals['net_cash']
+        total_value += totals['total_account_value']
+
+    combined = pd.concat([f for f in frames if not f.empty], ignore_index=True)
+    holdings = etrade.consolidate_holdings(combined, cash=total_cash)
+    summary = etrade.portfolio_summary(holdings, cash=total_cash)
+
+    print(f'Fetching transactions from {args.start} to {args.end}...')
+    transactions = etrade.get_all_consolidated_transactions(
+        accounts_obj, active_accounts, args.start, args.end,
+        account_map=account_map_store.load(),
+    )
+    cash_flows = classify.get_cash_flows(transactions)
+    income = classify.get_income(transactions)
+
+    report = analytics.PortfolioAnalytics(holdings, transactions, cash_flows).generate_full_report()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    today = datetime.date.today().isoformat()
+    excel.export_to_excel(
+        holdings, transactions, cash_flows, income,
+        output=os.path.join(args.output_dir, f'portfolio_consolidated_{today}.xlsx'),
+    )
+    excel.export_analytics_to_excel(
+        holdings, report,
+        output=os.path.join(args.output_dir, f'portfolio_analytics_{today}.xlsx'),
+    )
+
+    _print_summary(summary, report, total_value, total_cash)
+
+
+def _print_summary(summary, report, reported_total, cash):
+    print('\n' + '=' * 60)
+    print('PORTFOLIO SUMMARY')
+    print('=' * 60)
+    print(f'  Positions          {summary["Total Stock Market Value"]:>14,.2f}')
+    print(f'  Cash               {cash:>14,.2f}')
+    print(f'  Total value        {summary["Total Portfolio Value"]:>14,.2f}')
+    print(f'  E*TRADE reports    {reported_total:>14,.2f}')
+
+    drift = abs(reported_total - summary['Total Portfolio Value'])
+    if reported_total and drift > max(50.0, reported_total * 0.005):
+        print(f'  ! Differs from E*TRADE by {drift:,.2f} — check pending settlements.')
+
+    flows = report[schema.CASH_FLOWS]
+    print(f'\n  Deposited          {flows[schema.TOTAL_DEPOSITED]:>14,.2f}')
+    print(f'  Withdrawn          {flows[schema.TOTAL_WITHDRAWN]:>14,.2f}')
+
+    needs_review = flows.get(schema.FLOWS_NEEDING_REVIEW, 0)
+    if needs_review:
+        print(f'  ! {needs_review} transfer(s) counted as external because the counterparty')
+        print('    account is unrecognised. Review them in the dashboard.')
+
+    performance = report[schema.PERFORMANCE]
+    print(f'\n  Unrealised return  {performance[schema.TOTAL_RETURN_PCT]:>13,.2f}%')
+    adjusted = performance[schema.DEPOSIT_ADJUSTED_RETURN_PCT]
+    if adjusted is not None:
+        print(f'  Deposit-adjusted   {adjusted:>13,.2f}%')
+        print(f'    {performance[schema.DEPOSIT_ADJUSTED_RETURN_BASIS]}')
+
+    concentration = report[schema.CONCENTRATION]
+    print(f'\n  Positions          {concentration[schema.TOTAL_POSITIONS]:>14}')
+    print(f'  Top 5 weight       {concentration[schema.TOP_5_PCT]:>13,.2f}%')
+    print(f'  HHI                {concentration[schema.HHI]:>14,.0f}  '
+          f'({concentration[schema.HHI_INTERPRETATION]})')
+    print('=' * 60)
+
+
+if __name__ == '__main__':
     try:
-        print("=" * 60)
-        print("PORTFOLIO CONSOLIDATOR & ANALYTICS")
-        print("=" * 60)
-
-        # ===== CONSOLIDATION PHASE =====
-        print("\n[1/4] Authenticating with E*TRADE...")
-        auth_tokens = authenticate_etrade()
-
-        print("[2/4] Fetching accounts and portfolios...")
-        active_accounts, accounts_obj = fetch_active_accounts(auth_tokens)
-
-        # Consolidate portfolio across all active accounts
-        combined_portfolio = pd.DataFrame()
-        total_cash = 0
-
-        for key in active_accounts['accountIdKey']:
-            account_portfolio = get_portfolio(accounts_obj, key)
-            combined_portfolio = pd.concat([combined_portfolio, account_portfolio])
-            total_cash += get_cash_balance(accounts_obj, key)
-
-        combined_portfolio = combined_portfolio.sort_values(by='Symbol Description').reset_index(drop=True)
-
-        # Consolidate holdings
-        consolidated_portfolio = consolidate_holdings(combined_portfolio, total_cash)
-        summary = portfolio_summary(consolidated_portfolio, total_cash)
-
-        # Get transaction data using CLI-provided (or default) date range
-        start_date = args.start
-        end_date = args.end
-
-        print(f"   Fetching transactions from {start_date} to {end_date}...")
-        transaction_data = get_all_consolidated_transactions(accounts_obj, active_accounts, start_date, end_date)
-        cash_flow_data = get_cash_flows(transaction_data)
-
-        if not cash_flow_data.empty:
-            deposits = cash_flow_data[cash_flow_data['Category'] == 'Deposit']['Total Value'].sum()
-            withdrawals = cash_flow_data[cash_flow_data['Category'] == 'Withdrawal']['Total Value'].sum()
-            print(f"   Found {len(cash_flow_data)} cash flow(s): "
-                  f"${deposits:,.2f} deposited, ${abs(withdrawals):,.2f} withdrawn")
-
-        # Extract income rows (dividends, interest) — separate from external cash flows
-        if not transaction_data.empty and 'Category' in transaction_data.columns:
-            income_rows = transaction_data[transaction_data['Category'] == 'Income'].copy()
-            if not income_rows.empty:
-                income_data = income_rows[['Date', 'Security Name', 'Total Value', 'Transaction Type']].rename(
-                    columns={'Security Name': 'Description'}
-                )
-                total_income = pd.to_numeric(income_data['Total Value'], errors='coerce').sum()
-                print(f"   Found {len(income_data)} income transaction(s): ${total_income:,.2f} total")
-            else:
-                income_data = None
-        else:
-            income_data = None
-
-        # Build output paths
-        output_dir = args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        date_str = datetime.date.today().strftime("%Y-%m-%d")
-        holdings_file = os.path.join(output_dir, f'portfolio_consolidated_{date_str}.xlsx')
-        analytics_file = os.path.join(output_dir, f'portfolio_analytics_{date_str}.xlsx')
-
-        # Export consolidated portfolio
-        print("[3/4] Exporting consolidated portfolio...")
-        export_to_excel(consolidated_portfolio, transaction_data,
-                        cash_flows_df=cash_flow_data, income_df=income_data,
-                        filename=holdings_file)
-
-        print("\n" + "=" * 60)
-        print("PORTFOLIO SUMMARY")
-        print("=" * 60)
-        for key, value in summary.items():
-            if key == 'Largest Holdings':
-                print(f"{key}:")
-                for holding in value:
-                    print(f"  {holding['Symbol']}: ${holding['Market Value']:,.2f} ({holding['Percent of Portfolio']:.2f}%)")
-            elif isinstance(value, float):
-                print(f"{key}: {value:,.2f}")
-            else:
-                print(f"{key}: {value}")
-
-        # ===== ANALYTICS PHASE =====
-        print("\n" + "=" * 60)
-        print("[4/4] GENERATING ANALYTICS & RISK METRICS")
-        print("=" * 60)
-
-        analytics = PortfolioAnalytics(consolidated_portfolio, transaction_data, cash_flow_data)
-        full_report = analytics.generate_full_report()
-
-        # Export analytics to separate Excel file
-        export_analytics_to_excel(consolidated_portfolio, full_report, filename=analytics_file)
-        
-        print("\n" + "=" * 60)
-        print("✓ COMPLETE - All reports generated successfully")
-        print("=" * 60)
-        
-    except Exception as e:
-        print(f"\n✗ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-
-if __name__ == "__main__":
-    main()
+        main()
+    except Exception:
+        logging.exception('export failed')
+        raise SystemExit(1)
