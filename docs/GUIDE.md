@@ -1,621 +1,400 @@
-# E-Trade Portfolio Consolidator — Developer & User Guide
+# User & Developer Guide
 
-## Table of Contents
-
-- [Overview](#overview)
-- [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
 - [Setup](#setup)
-- [Usage](#usage)
-- [Module Reference](#module-reference)
-- [Data Flow](#data-flow)
-- [Excel Output Format](#excel-output-format)
+- [Running it](#running-it)
+- [The pages](#the-pages)
+- [How money is classified](#how-money-is-classified)
+- [What each metric means](#what-each-metric-means)
+- [Data storage and privacy](#data-storage-and-privacy)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
-
----
-
-## Overview
-
-A Python application that consolidates investment holdings across multiple E-Trade brokerage accounts into a single unified view. It connects to the E-Trade API via OAuth, aggregates positions by symbol, classifies transactions (trades, deposits, withdrawals, income), calculates deposit-adjusted performance using the Modified Dietz method, runs portfolio analytics, and exports professionally formatted Excel reports.
-
-### What It Does
-
-- Authenticates with E-Trade via OAuth 2.0 (browser-based)
-- Pulls holdings and cash balances from **all active accounts**
-- Merges duplicate positions across accounts (same symbol held in multiple accounts)
-- Calculates weighted average cost basis, gain/loss, and portfolio allocation
-- Retrieves full transaction history across **all accounts** in arbitrary date ranges (automatically chunks into 89-day windows to comply with the API limit)
-- Classifies transactions: Trades, Deposits, Withdrawals, Income (dividends/interest), Internal (excluded)
-- Calculates deposit-adjusted return (Modified Dietz) separating investment gains from cash contributions
-- Generates risk and concentration analytics
-- Exports everything to formatted `.xlsx` files
-
----
-
-## Project Structure
-
-```
-E-Trade consolidator/
-├── GUIDE.md                        # This file
-├── .env                            # API credentials (gitignored)
-├── .gitignore
-│
-├── new work/                       # Active modular codebase
-│   ├── main.py                     # Orchestrator entry point (run this)
-│   ├── consolidator.py             # Core data retrieval, consolidation, and transaction classification
-│   ├── analytics.py                # Portfolio analytics engine
-│   └── sectors.json                # Editable sector-to-symbol mappings (~140 symbols, 11 sectors)
-│
-├── outputs/                        # Historical Excel exports (gitignored)
-└── archive/                        # Deprecated code kept for reference (gitignored)
-```
-
-Output files (`.xlsx`) are written to the directory specified by `--output-dir` (default: current directory).
-
----
-
-## Prerequisites
-
-- **Python 3.10+** (developed on 3.12)
-- **E-Trade developer account** with API access enabled
-- **Consumer key and secret** from E-Trade's developer portal
-
-### Dependencies
-
-```bash
-pip install pyetrade pandas numpy xlsxwriter python-dotenv
-```
-
-| Package | Purpose |
-|---------|---------|
-| `pyetrade` | E-Trade API wrapper |
-| `pandas` | Data manipulation |
-| `numpy` | Numerical operations |
-| `xlsxwriter` | Excel file generation |
-| `python-dotenv` | `.env` file loading |
+- [Developing](#developing)
 
 ---
 
 ## Setup
 
-### 1. Enter the project directory
+Python 3.10 or newer.
 
 ```bash
-cd "E-Trade consolidator"
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-### 2. Create a virtual environment
+### Credentials
+
+Fill in `.env` (gitignored):
+
+```
+CONSUMER_KEY=...          # from developer.etrade.com
+CONSUMER_SECRET=...
+APP_PASSWORD_HASH=...     # dashboard login
+GUEST_PASSWORD=           # optional, read-only; leave blank to disable
+```
+
+Generate the password hash:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # macOS/Linux
+python -c "import hashlib,secrets;s=secrets.token_hex(16);p=input('password: ');print(f'{s}\${hashlib.sha256((s+p).encode()).hexdigest()}')"
 ```
 
-### 3. Install dependencies
+A plain `APP_PASSWORD=` still works, so an existing install keeps running, but the
+hash keeps the password out of the environment in readable form.
 
-```bash
-pip install pyetrade pandas numpy xlsxwriter python-dotenv
-```
+On Streamlit Cloud, put the same keys in the app's secrets instead of `.env`.
 
-### 4. Configure API credentials
+### Two dependencies that are not optional
 
-Create a `.env` file in the project root:
+Both are already pinned in `requirements.txt`; they are called out because
+removing either produces a confusing failure rather than an error.
 
-```
-CONSUMER_KEY = "your_consumer_key_here"
-CONSUMER_SECRET = "your_consumer_secret_here"
-```
-
-These are your E-Trade API production keys. Do not commit this file (it is listed in `.gitignore`).
+- **`lxml`** — yfinance parses the earnings-dates table with `pandas.read_html`,
+  which needs a parser backend. Without it, `get_earnings_dates()` raises
+  `ImportError`, the exception is caught, and every symbol quietly stores empty
+  earnings. Symptom: no EPS anywhere, no history, no error.
+- **`starlette<1.4`** — starlette 1.4 changed `GZipResponder.__init__`, which
+  Streamlit subclasses. Every page request returns 500. Remove the ceiling once
+  Streamlit adapts.
 
 ---
 
-## Usage
+## Running it
 
-```bash
-cd "new work"
-python main.py
+**Dashboard** — `streamlit run app.py`
+
+Log in, open **E\*TRADE Connection** in the sidebar, press **Get authorization
+URL**, authorize in the browser tab that opens, paste the verifier code back, then
+press **Refresh data**.
+
+The default date range starts at 2000-01-01. That is deliberate: reaching back
+past account opening is what makes the deposit-adjusted return meaningful (see
+[below](#deposit-adjusted-return)). E\*TRADE limits each request to 90 days, so
+long ranges are split into 89-day windows automatically — a full history takes a
+minute or two.
+
+**Demo** — `streamlit run demo.py`
+
+The same pages against fictional holdings with live prices. Thesis notes go to a
+separate file, so the demo cannot overwrite real ones.
+
+**CLI** — `python cli.py [--start YYYY-MM-DD] [--end YYYY-MM-DD] [--output-dir DIR]`
+
+Writes `portfolio_consolidated_<date>.xlsx` and `portfolio_analytics_<date>.xlsx`,
+and prints a summary. `--verbose` logs every classification decision.
+
+---
+
+## The pages
+
+### Overview
+Headline numbers with their provenance stated: live, cached, or a saved snapshot,
+and when. **Per-account balances** expands to show each account's Total Account
+Value and cash so you can check them against the E\*TRADE website directly. If
+positions plus cash disagree with what E\*TRADE reports by more than 0.5%, the
+page says so rather than picking one.
+
+### Holdings
+Every position, sorted by value, with allocation and sector charts. Cash is
+summarised separately — it is not a holding.
+
+### Value Over Time
+End-of-day value for every trading day, rebuilt from transaction history and daily
+closes. Share counts are walked **backwards** from today's holdings rather than
+forwards from an assumed-empty account, so today is exact by construction and any
+gap in the transaction feed surfaces as a residual share count in the earliest
+dates. **Data quality** reports those residuals rather than absorbing them.
+
+### Performance
+Returns, concentration, sector mix, and the spread of position outcomes. See
+[metrics](#what-each-metric-means).
+
+### Cash Flows & Income
+Deposits and withdrawals, dividends and interest, and **Transfer Review** — the
+transfers the app could not classify alone. See [classification](#how-money-is-classified).
+
+### Transactions
+The full history with filters. Internal transfers are hidden by default (they net
+to zero and would bury the trades) and the Category filter surfaces them. An
+expander explains how every transfer was classified and why.
+
+### Earnings
+Next report date and consensus EPS estimate per holding, and how recent quarters
+landed. Past quarters are fetched once and kept; upcoming dates are re-checked
+weekly. First load takes a few seconds for a typical portfolio.
+
+The **Reported** column is labelled honestly. The EPS source is indexed by fiscal
+*quarter end*, not the announcement date, and the two can be a month apart. Where
+the real announcement date is known the column shows it; where it is not, the
+quarter end is shown, the page says so, and the next-day price move is left blank
+rather than measured against the wrong day.
+
+ETFs, trusts and funds have no earnings. Seeing them listed under "no earnings
+data" is correct, not a failure.
+
+### Thesis Tracker
+Free-text thesis, catalysts, target price and dated notes per position, with a
+status you set.
+
+### What-If: Hold
+What sold positions would be worth today, split-adjusted. Reported as **decision
+value** — proceeds minus value if held — so positive means selling was the right
+call and is green. Percent leads because a dollar difference mostly measures how
+large the position was.
+
+---
+
+## How money is classified
+
+Every non-trade transaction gets exactly one category:
+
+| Category | Meaning | Counts as a cash flow? |
+|---|---|---|
+| `Deposit` | External money in (ACH, wire, IRA contribution) | Yes |
+| `Withdrawal` | External money out | Yes |
+| `Income` | Dividends, interest, fees — generated inside the account | No |
+| `Internal` | Movement between your own accounts | No |
+| `Trade` | Security buy or sell | No |
+| `Other` | Unrecognised — shown, never silently included | No |
+
+This matters because deposit-adjusted return subtracts external cash flows. Count
+a dividend as a deposit and it disappears from your return; count an inter-account
+transfer as a withdrawal and your return is overstated.
+
+### Why transfers need two passes
+
+E\*TRADE describes a move between your own accounts and a real withdrawal almost
+identically:
+
+```
+TRANSFER TO XXXXX1344 REFID:132627026906     -111.38   your other E*TRADE account
+TRANSFER FROM XXXXX7449 REFID:132627026906   +111.38   ... the matching leg
+TRANSFER TO XXXXX1607 REFID:128218358906     -500.00   money that actually left
 ```
 
-### CLI Options
+No single row can tell those apart, so classification runs twice.
+
+**Pass 1** settles everything one row can prove. `ACH DEPOSIT`, `Contribution`,
+`Dividend`, `Interest Income` are unambiguous. So is an in-kind security move
+(`NVDA TFR TO ACCT XXXXX-7449-0`, $0) — no cash changed hands. Anything with a
+counterparty account number is parked.
+
+**Pass 2** runs once over **all accounts combined** and settles the parked rows:
+
+1. **Reference pairing.** Two legs sharing a REFID, one positive and one negative,
+   summing to zero, are two halves of one move. Both become `Internal`. This is
+   evidence, not inference, so it wins outright.
+2. **Counterparty lookup.** Otherwise the last four digits are checked against your
+   own accounts and against the account map you build in Transfer Review.
+3. **External by default.** If the far side were one of your accounts, its matching
+   leg would be in the data and step 1 would have found it. So an unrecognised
+   counterparty is treated as external — and flagged **Needs Review** so the app
+   asks rather than assumes.
+
+### Transfer Review
+
+Cash Flows & Income → **Transfer Review** lists every counterparty account still
+unresolved, with how many transfers and how much money hinge on the answer. Tag
+each as yours or external once; the answer is stored in `data/account_map.json`
+and applied on the next refresh.
+
+Until you tag one, its transfers count as external cash flows, and Overview says
+so. That is the conservative direction — it understates return rather than
+overstating it.
+
+### If a category looks wrong
+
+Transactions → **How transfers were classified** shows the reason for every
+decision. `Other` rows are excluded from all totals and listed so you can see what
+was skipped.
+
+---
+
+## What each metric means
+
+Percentages are whole numbers throughout (30.11 means 30.11%).
+
+### Unrealised gain
+Current position value minus what was paid for it. **Cash is excluded from both
+sides** — it has no cost basis, so including it in value alone would report
+uninvested cash as investment gain.
+
+### Deposit-adjusted return
+
+Modified Dietz. Weights each deposit and withdrawal by how long it was invested,
+so contributions do not read as performance:
 
 ```
-python main.py [--start YYYY-MM-DD] [--end YYYY-MM-DD] [--output-dir DIR]
+R = (EMV − BMV − CF) / (BMV + Σ CFᵢ × Wᵢ)
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--start` | Jan 1 of current year | Start date for transaction history |
-| `--end` | Today | End date for transaction history |
-| `--output-dir` | `.` (current directory) | Where to write Excel output files |
+**The assumption that matters.** BMV — portfolio value at the start of the range —
+defaults to zero, which is correct when the transaction range covers the account's
+whole life. That is why the default start date is 2000. **If your range does not
+reach account opening, this overstates the return**, and the figure on screen says
+so beneath it.
 
-Example — pull all of 2025:
+Do not compare it to a fund's published return: it is money-weighted (it reflects
+your timing), while fund returns are time-weighted (they do not).
 
-```bash
-python main.py --start 2025-01-01 --end 2025-12-31 --output-dir ~/reports/
-```
+### Concentration
 
-### What Happens at Runtime
+**HHI** is the sum of squared position weights, 0–10000. Under 1500 is well
+diversified, above 2500 concentrated. **Effective positions** (10000 ÷ HHI) is how
+many equally weighted positions would give the same concentration — 20 holdings
+with an effective count of 5 means five of them are doing the work.
 
-1. A browser window opens to E-Trade's OAuth authorization page
-2. Log in and authorize the application
-3. Copy the verification code from the browser
-4. Paste the code into the terminal prompt
-5. Holdings, cash balances, and transactions are fetched across all active accounts
-6. Console prints a portfolio summary and transaction/income counts
-7. Two Excel files are written to the output directory
+Weights are shares of **invested value, excluding cash**. Concentration is a
+question about how the invested money is spread.
 
-### Output Files
+### Spread of returns
+Standard deviation of position lifetime gains. **Descriptive only.** These are not
+periodic returns — a position held four years and one held a week contribute
+equally, and the number has no time unit.
+
+### What was removed, and why
+
+Earlier versions reported **Sharpe and Sortino ratios** computed from position
+lifetime gains. Those ratios are defined over a time series of periodic returns; a
+cross-section of "how much is each position up since I bought it" is not one. The
+resulting number could not be compared to a published Sharpe ratio for anything.
+It was removed rather than displayed with a caveat. The raw dispersion remains,
+labelled for what it is.
+
+### Portfolio history
+Value is rebuilt on **today's share basis**: historical closes from the data source
+are split-adjusted, so share counts must be too. A trade of 10 shares before a 10:1
+split counts as 100 shares today. The raw count held at the time is shown
+separately, for display only.
+
+Prices are split-adjusted but **not** dividend-adjusted. That is intentional: a
+dividend was paid out as cash and is picked up by the cash reconstruction, so
+adjusting the price for it as well would count it twice.
+
+---
+
+## Data storage and privacy
+
+Everything lives in `data/`, which is gitignored.
 
 | File | Contents |
-|------|----------|
-| `portfolio_consolidated_YYYY-MM-DD.xlsx` | Holdings, Transactions, Cash Flows, Income sheets |
-| `portfolio_analytics_YYYY-MM-DD.xlsx` | Analytics Summary and Holdings Detail sheets |
-
----
-
-## Module Reference
-
-### `consolidator.py`
-
-Core data retrieval, consolidation, and transaction classification.
-
-#### `authenticate_etrade() -> dict`
-
-Runs OAuth 2.0 flow. Opens the browser for user authorization. Returns a dict with `consumer_key`, `consumer_secret`, `oauth_token`, and `oauth_token_secret`.
-
-#### `fetch_active_accounts(auth_tokens) -> (DataFrame, ETradeAccounts)`
-
-Calls `list_accounts()`, filters to `accountStatus == 'ACTIVE'`. Returns a DataFrame of active accounts and the `pyetrade.ETradeAccounts` object for subsequent calls.
-
-#### `get_portfolio(accounts_obj, account_id_key) -> DataFrame`
-
-Fetches the complete portfolio for one account using the `Complete` view. Returns one row per position:
-
-| Column | Source |
-|--------|--------|
-| Symbol | `Product.symbol` |
-| Symbol Description | `Complete.symbolDescription` |
-| Current Price | `Complete.price` |
-| Quantity | `position.quantity` |
-| Date Acquired | `position.dateAcquired` (epoch ms → datetime) |
-| Price Paid | `position.pricePaid` |
-| Total Cost | `position.totalCost` |
-| Market Value | `position.marketValue` |
-| Total Gain | `position.totalGain` |
-| Total Gain % | `position.totalGainPct` |
-| Percent of Portfolio | `position.pctOfPortfolio` |
-
-#### `get_cash_balance(accounts_obj, account_id_key) -> float`
-
-Returns `netCash` from the account balance endpoint.
-
-#### `consolidate_holdings(df, cash=0) -> DataFrame`
-
-Groups positions by `Symbol` across all accounts. Aggregates quantity, cost, and market value; recalculates weighted average price paid, total gain, gain %, and portfolio allocation. Appends a `CASH` row if `cash > 0`. Sorts by market value descending.
-
-#### `portfolio_summary(consolidated_df, cash=0) -> dict`
-
-Returns summary stats: stock count, total market value and cost basis, total unrealized gain ($ and %), cash amount and percentage, and top 3 holdings by market value.
-
-#### `_date_chunks(start_date, end_date, chunk_days=89)`
-
-Generator that splits `[start_date, end_date]` into consecutive windows of at most `chunk_days`. Used internally to work around the E-Trade API's 90-day limit on `list_transactions`.
-
-#### `get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_date) -> DataFrame`
-
-Fetches **all** transactions for one account. Automatically chunks the date range into 89-day windows and merges results. Classifies every transaction into a `Category`:
-
-| Category | Transaction Types |
-|----------|-----------------|
-| `Trade` | `Bought`, `Sold` — details fetched via `list_transaction_details` |
-| `Deposit` | External money in: `Electronic Funds Transfer`, `ACH`, `Wire`, `Check`, `Contribution`, or description contains `"ACH DEPOSIT"` |
-| `Withdrawal` | External money out: same types with negative amount, or `Distribution` |
-| `Income` | `Dividend`, `Interest`, `Fee`, `Refund` |
-| `Internal` | `Journal` with no external signal — **excluded from all output** |
-| `Other` | Unrecognised types with no clear signal |
-
-Returns columns: `Date`, `Security Name`, `Quantity`, `Price`, `Total Value`, `Transaction Type`, `Category`.
-
-#### `_classify_non_trade(t_type, description, amount) -> str`
-
-Priority-based classifier for non-trade transactions. See category table above. Called internally by `get_consolidated_transactions`.
-
-#### `get_all_consolidated_transactions(accounts_obj, active_accounts, start_date, end_date) -> DataFrame`
-
-Loops over all active accounts and concatenates their transaction DataFrames. Sorted newest-first.
-
-#### `get_cash_flows(transaction_df) -> DataFrame`
-
-Filters a full transaction DataFrame to only `Deposit` and `Withdrawal` rows. Returns columns `Date`, `Description`, `Total Value`, `Category`. Used as input for Modified Dietz return calculations.
-
-#### `export_to_excel(consolidated_df, transactions_df=None, cash_flows_df=None, income_df=None, filename=None, summary_spacing=3)`
-
-Writes a formatted `.xlsx` file with up to four sheets:
-
-| Sheet | Condition | Contents |
-|-------|-----------|----------|
-| Holdings | Always | Position data with currency/percentage formatting + summary block |
-| Transactions | If `transactions_df` provided | All trades and classified non-trade transactions |
-| Cash Flows | If `cash_flows_df` provided | Deposits (green) and withdrawals (red) with totals |
-| Income | If `income_df` provided | Dividends (gold) and interest (blue) with per-type totals |
-
-Default filename: `portfolio_consolidated_YYYY-MM-DD.xlsx`.
-
----
-
-### `analytics.py`
-
-Portfolio analytics engine. All methods return plain dicts; the class performs no API calls.
-
-#### Class: `PortfolioAnalytics`
-
-```python
-analytics = PortfolioAnalytics(
-    consolidated_df,          # from consolidate_holdings()
-    transactions_df=None,     # from get_all_consolidated_transactions()
-    cash_flows_df=None,       # from get_cash_flows() — derived automatically if None
-    risk_free_rate=0.04       # annual rate for Sharpe/Sortino (default 4%)
-)
-```
-
-Internal attributes:
-- `self.holdings` — positions only (CASH row excluded)
-- `self.cash` — cash balance as a float
-- `self.cash_flows` — Deposit/Withdrawal rows (derived from `transactions_df` if `cash_flows_df` not provided)
-- `self.income` — Income-category rows (dividends, interest)
-
-#### `concentration_analysis() -> dict`
-
-HHI Score, Effective Positions, Top 3/5/10 Holdings %, Diversification Score.
-
-HHI interpretation: < 1500 Well Diversified, < 2500 Moderately Diversified, < 5000 Concentrated, ≥ 5000 Highly Concentrated.
-
-#### `sector_analysis() -> dict`
-
-Maps symbols to sectors loaded from `sectors.json` (falls back to built-in defaults if missing). Returns dollar and percentage allocation per sector. Unmatched symbols go to `Other`. To add symbols, edit `sectors.json` — no Python changes needed.
-
-#### `performance_metrics() -> dict`
-
-- Simple return ($ and %) based on cost basis vs. current market value
-- **Deposit-Adjusted Return (Modified Dietz)**: accounts for the timing of deposits and withdrawals so cash contributions are not mistaken for investment gains
-  - Formula: `R = (EMV - BMV - CF) / (BMV + Σ(CF_i × W_i))`
-  - BMV approximated as total cost basis (no period-start snapshot available)
-- Total Deposits, Total Withdrawals, Net Cash Flows
-
-#### `cash_flow_summary() -> dict`
-
-Deposit and withdrawal counts, totals, largest transaction, and most recent date for each direction.
-
-#### `income_summary() -> dict`
-
-Total income received, broken down by type (Dividend, Interest, etc.) with counts and most recent payment date. Income is generated inside the account and does not affect deposit-adjusted return.
-
-#### `risk_metrics() -> dict`
-
-Volatility (std dev of position gain %s), Downside Deviation, Win Rate, Best/Worst Performer, Sharpe Ratio, Sortino Ratio.
-
-Note: ratios use position-level gain percentages as a simplified proxy for time-series returns.
-
-#### `liquidity_analysis() -> dict`
-
-Cash balance, cash percentage, and a liquidity score (65–85).
-
-#### `transaction_analysis() -> dict`
-
-Buy/sell counts, total amounts, portfolio turnover, and average transaction size.
-
-#### `holdings_quality_analysis() -> dict`
-
-Positions bucketed by gain %: Highly Profitable (>50%), Profitable (0–50%), Breakeven, Small Loss, Moderate Loss, Major Loss. Identifies best and worst performers.
-
-#### `generate_full_report() -> dict`
-
-Runs all methods and returns a combined dict with keys: Concentration Analysis, Sector Analysis, Performance Metrics, Cash Flow Summary, Income Summary, Risk Metrics, Liquidity Analysis, Holdings Quality, Transaction Analysis.
-
-#### `export_analytics_to_excel(consolidated_df, analytics_report, filename=None)`
-
-Writes the analytics report to Excel with two sheets: **Analytics Summary** (all metrics as key-value pairs with nested dicts expanded) and **Holdings Detail** (full position table).
-
-Default filename: `portfolio_analytics_YYYY-MM-DD.xlsx`.
-
----
-
-## Data Flow
-
-```
-E-Trade API (OAuth 2.0)
-    │
-    ▼
-fetch_active_accounts()         → list of account IDs (all active accounts)
-    │
-    ▼
-For each account (in parallel loops):
-    get_portfolio()             → raw positions DataFrame
-    get_cash_balance()          → float
-    │
-    ▼
-pd.concat(all accounts)         → combined DataFrame
-    │
-    ▼
-consolidate_holdings()          → grouped by Symbol, gains recalculated, CASH row appended
-    │
-    ▼
-portfolio_summary()             → dict of summary stats (printed to terminal)
-    │
-    ▼
-get_all_consolidated_transactions()   → all transactions across all accounts
-    │                                   (auto-chunked into 89-day windows)
-    ├── get_cash_flows()         → Deposit/Withdrawal rows only
-    └── income rows (inline)    → Income rows (Dividend/Interest)
-    │
-    ▼
-export_to_excel()               → portfolio_consolidated_YYYY-MM-DD.xlsx
-    │                             (Holdings + Transactions + Cash Flows + Income sheets)
-    ▼
-PortfolioAnalytics()            → analytics object
-    │
-    ▼
-generate_full_report()          → dict of all analytics sections
-    │
-    ▼
-export_analytics_to_excel()     → portfolio_analytics_YYYY-MM-DD.xlsx
-```
-
----
-
-## Excel Output Format
-
-### `portfolio_consolidated_*.xlsx`
-
-**Holdings sheet**
-
-| Column | Format | Description |
-|--------|--------|-------------|
-| Symbol | Text | Ticker symbol |
-| Symbol Description | Text | Full security name |
-| Current Price | $#,##0.00 | Latest price per share |
-| Quantity | Number | Total shares held |
-| Date Acquired | Date | Earliest purchase date across accounts |
-| Price Paid | $#,##0.00 | Weighted average cost per share |
-| Total Cost | $#,##0.00 | Total amount invested |
-| Market Value | $#,##0.00 | Current total value |
-| Total Gain | $#,##0.00 | Unrealized gain/loss |
-| Total Gain % | 0.00 | Return percentage (whole number, e.g. 21.47 = 21.47%) |
-| Percent of Portfolio | 0.00 | Allocation weight (whole number) |
-
-Followed by a summary block with totals, cash, and total portfolio value.
-
-**Transactions sheet** — all transaction types with `Category` column.
-
-**Cash Flows sheet** — Deposits highlighted green, Withdrawals red. Summary block with Total Deposited, Total Withdrawn, Net Cash Flow.
-
-**Income sheet** — Dividends highlighted gold, Interest blue. Summary with per-type subtotals.
-
-### `portfolio_analytics_*.xlsx`
-
-**Analytics Summary** — all metrics as a two-column key/value table. Nested dicts are expanded with indented sub-rows.
-
-**Holdings Detail** — full position data.
+|---|---|
+| `portfolio_cache.json` | Last refresh: holdings, transactions, report |
+| `month_end_snapshot.json` | Saved point-in-time copy; what guests see |
+| `price_store.json` | Daily closes and splits, cached per symbol |
+| `earnings_store.json` | Past quarters and next report dates |
+| `thesis.json` / `thesis_demo.json` | Your notes / demo fixtures |
+| `symbol_map.json` | Manual ticker mappings you confirmed |
+| `account_map.json` | Transfer counterparties you tagged |
+
+**Nothing is written to any remote.** An earlier version pushed snapshots and the
+earnings store to this GitHub repository through the Contents API — which bypasses
+`.gitignore`, into a repository that is public. That path is gone. Moving a
+snapshot between machines is an explicit download-then-upload in the Snapshot
+panel.
+
+Deleting anything in `data/` is safe: caches rebuild on the next refresh. Only
+`thesis.json` and `account_map.json` hold decisions you cannot regenerate — back
+those up.
 
 ---
 
 ## Security
 
-- API keys stored in `.env`, loaded via `python-dotenv`, excluded from version control
-- OAuth tokens obtained at runtime, not persisted to disk
-- Application uses production E-Trade endpoints (`dev=False`)
-- **Read-only API calls only**: `list_accounts`, `get_account_portfolio`, `get_account_balance`, `list_transactions`, `list_transaction_details` — no trades or transfers
+**The password gate is a speed bump, not authentication.** The failed-attempt
+counter and lockout live in Streamlit session state, so they slow down someone
+guessing in one browser tab but reset on reload and stop nothing scripted.
+
+For local use that is fine. **Do not expose this to the internet without a real
+authenticating proxy in front of it** — Tailscale, Cloudflare Access, an OAuth
+proxy, or an SSH tunnel.
+
+Other notes:
+
+- E\*TRADE OAuth tokens live in session state only and are never written to disk.
+  They expire when the session ends.
+- Guest mode is read-only: no refresh, no exports, no tagging, no thesis edits.
+- Never commit `.env` or anything in `data/`. Both are gitignored; the Contents
+  API bypasses gitignore, which is why remote persistence was removed.
+- Transaction descriptions are logged at DEBUG only. `--verbose` on the CLI prints
+  them; do not use it where the terminal is shared.
 
 ---
 
 ## Troubleshooting
 
-### OAuth authorization fails
+**Cash shows $0.**
+Fixed, but if it recurs: `Computed.accountBalance` is a cash-side figure, not
+total account value — that is `Computed.RealTimeValues.totalAccountValue`. Any
+code deriving cash by subtracting positions from `accountBalance` will produce a
+negative number. Check the per-account expander on Overview against the E\*TRADE
+website.
 
-Verify `CONSUMER_KEY` and `CONSUMER_SECRET` in `.env` are correct. The verification code expires quickly — enter it promptly after authorizing.
+**Withdrawals total $0 but you know you withdrew money.**
+A transfer type is missing from `TRANSFER_TYPES` in `portfolio/classify.py`, or the
+counterparty is tagged internal in `data/account_map.json`. Transactions →
+Category → `Other` shows anything unclassified.
 
-### Empty or incomplete transaction data
+**Earnings are empty and EPS never populates.**
+`lxml` is missing, or the symbol is an ETF. Check the errors expander at the
+bottom of the Earnings page. `pip install -r requirements.txt` fixes the first.
 
-The API limits each `list_transactions` call to a 90-day window. The code automatically chunks the date range, but if you see warnings like `failed to fetch transactions YYYY-MM-DD – YYYY-MM-DD`, the API may be throttling or returning errors for that window.
+**The dashboard 500s on every request.**
+starlette 1.4+. `pip install -r requirements.txt` restores the pin.
 
-### Deposits not appearing / wrong classification
+**Excel download fails.**
+The error and traceback are shown in an expander under the button. If the
+workbook builds but is stale, refresh — it is cached per dataset.
 
-Every non-trade transaction prints a `[TXN]` debug line showing `type`, `description`, `amount`, and resolved `Category`. If a deposit is misclassified, share those lines — the description text drives classification for ambiguous types like `Transfer`.
+**"No data loaded" on a fresh machine.**
+No cache and no snapshot. Connect to E\*TRADE and refresh, or import a snapshot
+file in the Snapshot panel.
 
-### Suspicious withdrawals in Cash Flows
+**A metric reads as an em dash.**
+The report key is missing from the contract. Run `pytest tests/test_schema.py` —
+it fails on exactly this.
 
-These are usually `Journal` entries — internal E-Trade bookkeeping for inter-account movements. `Journal` transactions with no external keywords in their description are classified as `Internal` and excluded. If a real deposit is being excluded, its `[TXN]` line will show `→ Internal`.
-
-### Sector analysis shows most holdings as "Other"
-
-Edit `sectors.json` in the `new work/` directory to add your symbols. No Python changes needed. The file is a simple dict of `{ "Sector Name": ["TICK1", "TICK2", ...] }`.
-
-### Excel file won't open
-
-Close any previously opened version of the file before re-running. XlsxWriter cannot append to existing files — it always creates new ones.
-
-### Rate limiting
-
-The script calls `list_transaction_details` once per trade in a loop with no backoff. Accounts with many trades in a single 89-day window may hit E-Trade's rate limits. If transactions are missing, wait a minute and re-run.
-
----
-
-## Streamlit Dashboard
-
-The project includes a browser-based dashboard at `new work/app.py`. It shows all the same data as the Excel output but live, in your browser, from anywhere.
-
-### Installation
-
-```bash
-pip install streamlit plotly yfinance
-# or install everything at once:
-pip install -r "new work/requirements.txt"
-```
-
-### Configuration
-
-Add the following to your root `.env` file (same one that holds `CONSUMER_KEY` and `CONSUMER_SECRET`):
-
-```
-APP_PASSWORD=choose_a_password_here
-```
-
-### Running locally
-
-```bash
-cd "new work"
-streamlit run app.py
-```
-
-The app opens at `http://localhost:8501`.
-
-### Running remotely (VPS or home server)
-
-```bash
-cd "new work"
-streamlit run app.py --server.port 8501 --server.address 0.0.0.0
-```
-
-Then access it at `http://your-server-ip:8501`. Consider putting it behind a reverse proxy (nginx, Caddy) with HTTPS for production use.
-
-### Connecting to E-Trade
-
-1. Open the app and enter your password.
-2. In the sidebar, click **Get Authorization URL** — this generates a fresh OAuth request.
-3. Click **Authorize on E-Trade ↗** — this opens E-Trade's login page in a new tab.
-4. After authorizing, E-Trade shows a verifier code. Paste it into the sidebar and click **Connect**.
-5. Once connected (🟢 badge), set the date range and click **🔄 Refresh Data**.
-
-The refresh fetches all holdings and transactions live and saves a snapshot to `data/portfolio_cache.json`. If you close the browser and reopen, the app loads from cache automatically (🟡 Cached badge) — no re-authentication needed until the cache is stale.
-
-### Pages
-
-| Page | Description |
-|------|-------------|
-| Home | Portfolio KPIs + top holdings snapshot |
-| Holdings | Full holdings table + allocation & sector charts |
-| Analytics | Performance, concentration, risk metrics + charts |
-| Transactions | Filterable transaction history with pagination |
-| Cash Flows & Income | Cash flow timeline + income breakdown by month/type |
-| News & Earnings | Upcoming earnings calendar + per-stock news feed |
-| Thesis Tracker | Per-holding investment thesis with status tracking |
-| What-If: Hold | Value of sold positions had they been held |
-| Portfolio History | Daily portfolio value rebuilt from transaction history |
-
-### Portfolio History
-
-E\*TRADE reports only the portfolio as it stands today. This page reconstructs the
-end-of-day value for every trading day since your first transaction, and breaks it
-down by symbol, sector, asset type, or open/closed status.
-
-**How it works.** Share counts are walked *backwards* from today's holdings:
-
-```
-shares(day − 1) = (shares(day) − net shares traded that day) ÷ split ratio that day
-```
-
-Anchoring on today rather than building forward from an empty account keeps recent
-values exact by construction. Anything the transaction feed fails to explain — shares
-transferred in from another broker, transactions the API did not return — accumulates
-in the distant past instead, where the page reports it as a residual under **Data
-quality** rather than silently absorbing it into the numbers.
-
-Prices are official daily closes. Yahoo returns them **split-adjusted** even with
-`auto_adjust=False`, so share counts are converted to today's share basis before
-valuation; dividends are deliberately left unadjusted because they were paid out as
-cash and already appear in the reconstructed cash balance.
-
-**Symbol resolution.** Valuing a past position needs a ticker, and older cached
-transaction pulls carry only the security description. Resolution runs: the API's own
-`Symbol` column → a saved manual map → matching against current holdings. Whatever is
-left over gets an **Identify automatically** pass that proposes a ticker and then
-checks it against the prices you actually paid — a candidate whose daily high/low
-range brackets every one of your fills is confirmed by evidence rather than by name
-similarity. Proposals are shown with a confidence score for review before saving;
-nothing is written without confirmation.
-
-Refreshing transactions from the home page populates tickers directly from the API and
-removes the need for mapping altogether.
-
-| Module | Role |
-|--------|------|
-| `lib/portfolio_history.py` | Backward share walk, cash reconstruction, breakout grouping |
-| `lib/price_store.py` | Incremental daily close / split / metadata cache |
-| `lib/symbol_resolver.py` | Description → ticker resolution and price-based verification |
-| `lib/viz_theme.py` | Validated categorical palette and chart styling |
-
-### Thesis Tracker
-
-The thesis tracker stores data in `data/thesis.json` (auto-created). For each holding you can record:
-
-- **Status** — Unreviewed / On Track / Watch / At Risk / Broken / Exited
-- **Thesis** — the core investment case
-- **Entry Rationale** — why you bought it
-- **Key Catalysts** — what to watch for
-- **Target Price** — optional price target
-- **Expected Hold Period** — e.g. "Long-term", "2–3 years"
-- **Notes log** — append-only timestamped notes
-
-The overview table shows all holdings with colour-coded status badges so you can quickly see which positions need attention.
-
-### Data files (gitignored)
-
-| File | Purpose |
-|------|---------|
-| `data/portfolio_cache.json` | Last-fetched portfolio snapshot |
-| `data/thesis.json` | Thesis tracker data |
-| `data/price_store.json` | Daily closes, splits and symbol metadata for Portfolio History |
-| `data/symbol_map.json` | Confirmed security-description → ticker mappings |
-
-All are excluded from git via `.gitignore`. Deleting `price_store.json` is safe — it
-is a cache and refetches on the next visit. Deleting `symbol_map.json` discards
-confirmed ticker mappings, which then have to be re-identified.
+**Transaction fetch is slow.**
+Expected. Each trade needs a second API call for quantity and price, and long
+ranges are split into 89-day windows. A decade of history across two accounts
+takes a couple of minutes.
 
 ---
 
-### Deploying to Streamlit Community Cloud
+## Developing
 
-Streamlit Community Cloud cannot read your local `.env` file. Use **Secrets management** instead.
-
-1. Push the repo to GitHub (`.env` is gitignored — confirm it's absent before pushing).
-2. Go to [share.streamlit.io](https://share.streamlit.io), connect your repo, and set the main file to `new work/app.py`.
-3. In the app settings → **Secrets**, paste your credentials in TOML format:
-
-```toml
-CONSUMER_KEY = "your_etrade_consumer_key"
-CONSUMER_SECRET = "your_etrade_consumer_secret"
-APP_PASSWORD = "your_chosen_password"
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
-The app reads `st.secrets` first and falls back to env vars, so local dev (`.env`) and cloud (Secrets) both work without code changes.
+### The one architectural rule
 
----
+`portfolio/` holds data and logic and **must not import streamlit**. `ui/` holds
+everything that renders and may import `portfolio/`. This is what makes the logic
+testable without a Streamlit runtime.
 
-### Security notes
+### Report keys
 
-**What's protected:**
+Every key in the analytics report is a constant in `portfolio/schema.py`. Never
+spell one inline. `tests/test_schema.py` fails the build otherwise — this is the
+guard for the drift that once made the whole Performance page render em dashes
+while demo mode looked fine.
 
-- Password comparison uses `hmac.compare_digest()` — resistant to timing attacks.
-- Login is locked for 15 minutes after 5 failed attempts per session.
-- Sessions expire after 8 hours of inactivity.
-- CSRF protection is enabled in `config.toml`.
-- Consumer key/secret never leave `session_state` (cleared on disconnect).
+### Adding a page
 
-**For self-hosting (VPS / home server) — must-do:**
+Create `ui/yourpage.py`, start it with `page_header(...)`, and add an `st.Page`
+entry to the navigation dict in **both** `app.py` and `demo.py`. There are no
+filename prefixes; ordering comes from those dicts.
 
-- Put the app behind a reverse proxy (nginx or Caddy) with a TLS certificate. Never expose port 8501 directly to the internet.
-- Example Caddy config:
-  ```
-  your.domain.com {
-      reverse_proxy localhost:8501
-  }
-  ```
-- Optionally restrict access by IP in your firewall — since only you access it, this dramatically reduces attack surface even before the password prompt.
+### Adding a sector
 
-**Things to be aware of:**
+Edit `config/sectors.json`. Unmapped symbols appear as "Unclassified", and the
+Performance page tells you how much weight is unplaced.
 
-- `data/portfolio_cache.json` and `data/thesis.json` are plaintext JSON on disk. On Streamlit Cloud these live in the app's ephemeral filesystem (lost on restart). On a VPS, ensure the server itself is secured.
-- The password gate is a session-scoped single shared secret, not per-user authentication. Anyone who knows the password can access all data. That's fine for personal use.
-- News links from yfinance are rendered as clickable Markdown links. Streamlit does not execute JavaScript from rendered Markdown, so XSS is not a concern.
+### Changing classification
+
+`portfolio/classify.py`, and add a fixture to `tests/test_classify.py` using the
+real description wording. Every failure this code has had came from the exact
+text — `Online Transfer` missing from a list, a fraction not scaled to a
+percentage, a $0 in-kind row treated as cash.
