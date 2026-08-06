@@ -146,10 +146,22 @@ def _refresh_data(start_date, end_date) -> None:
     Each step reports its own failure rather than collapsing into one generic
     error, because "connection failed" and "analytics failed" call for entirely
     different responses from the user.
+
+    Each step also reports how long it took. "The refresh is slow" is not
+    actionable; "transactions took 180s and everything else took 2s" is, and the
+    difference between those two is one timer.
     """
     import math
+    import time
 
     auth_tokens = st.session_state['auth_tokens']
+    timings, started = {}, time.monotonic()
+
+    def done(label):
+        """Record elapsed time for a phase and return a caption for it."""
+        elapsed = time.monotonic() - started - sum(timings.values())
+        timings[label] = elapsed
+        return f' ({elapsed:.1f}s)'
 
     with st.status('Refreshing portfolio data…', expanded=True) as status:
         st.write('🔗 Connecting to E\\*TRADE…')
@@ -161,7 +173,7 @@ def _refresh_data(start_date, end_date) -> None:
             return
         st.session_state['active_accounts'] = active_accounts
         st.session_state['accounts_obj'] = accounts_obj
-        st.write(f'✅ {len(active_accounts)} active account(s)')
+        st.write(f'✅ {len(active_accounts)} active account(s)' + done('connect'))
 
         st.write('📊 Fetching positions and balances…')
         try:
@@ -186,7 +198,7 @@ def _refresh_data(start_date, end_date) -> None:
         positions_value = float(combined['Market Value'].sum()) if not combined.empty else 0.0
         st.write(
             f'✅ {len(holdings[holdings["Symbol"] != "CASH"])} positions '
-            f'({money(positions_value)}) · {money(cash)} cash'
+            f'({money(positions_value)}) · {money(cash)} cash' + done('holdings')
         )
 
         drift = abs(reported_total - (positions_value + cash))
@@ -247,7 +259,7 @@ def _refresh_data(start_date, end_date) -> None:
             status.update(label='Failed to fetch transactions', state='error')
             st.error(f'Could not fetch transactions: {exc}')
             return
-        st.write(f'✅ {len(transactions):,} transaction(s)')
+        st.write(f'✅ {len(transactions):,} transaction(s)' + done('transactions'))
 
         st.write('🧮 Computing analytics…')
         try:
@@ -262,6 +274,22 @@ def _refresh_data(start_date, end_date) -> None:
             st.error(f'Could not compute analytics: {exc}')
             st.exception(exc)
             return
+
+        st.write('✅ Analytics complete' + done('analytics'))
+
+        slowest = max(timings, key=timings.get)
+        st.caption(
+            'Time: ' + ' · '.join(f'{k} {v:.1f}s' for k, v in timings.items())
+            + f' — total {sum(timings.values()):.1f}s'
+        )
+        if timings[slowest] > 30:
+            st.caption(
+                f'⚠️ **{slowest}** took {timings[slowest]:.0f}s. If that is '
+                '*transactions*, check the window count above — each window is one '
+                'API round trip. If this server was started before the last code '
+                'change, restart it: Streamlit reloads page files but not the '
+                'modules they import.'
+            )
 
         needing_review = report[schema.CASH_FLOWS].get(schema.FLOWS_NEEDING_REVIEW, 0)
         if needing_review:
