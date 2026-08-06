@@ -44,7 +44,10 @@ STORE_PATH = paths.DATA_DIR / 'earnings_store.json'
 _STALENESS_DAYS = 7   # upcoming dates drift; past quarters never do
 _MAX_QUARTERS = 8     # kept per symbol
 _MAX_WORKERS = 6      # yfinance tolerates this comfortably; higher starts throttling
-_NEVER = '2000-01-01'
+#: Sentinel ``last_updated`` for a symbol that has never returned data, so it is
+#: always considered stale and retried. Callers must exclude it when reporting
+#: when data was last refreshed.
+NEVER = '2000-01-01'
 
 
 # ── Disk I/O ──────────────────────────────────────────────────────────────────
@@ -78,7 +81,7 @@ def fetch_symbol(symbol: str, existing: dict | None = None) -> dict:
     """
     existing = existing or {}
     result = {
-        'last_updated': existing.get('last_updated', _NEVER),
+        'last_updated': existing.get('last_updated', NEVER),
         'upcoming': None,
         'recent': list(existing.get('recent', [])),
         '_error': None,
@@ -297,9 +300,9 @@ def stale_symbols(symbols, store: dict) -> list:
             outdated.append(symbol)
             continue
         try:
-            last = date.fromisoformat(entry.get('last_updated', _NEVER))
+            last = date.fromisoformat(entry.get('last_updated', NEVER))
         except ValueError:
-            last = date.fromisoformat(_NEVER)
+            last = date.fromisoformat(NEVER)
         if (today - last).days >= _STALENESS_DAYS:
             outdated.append(symbol)
     return outdated
@@ -346,6 +349,6 @@ def _safe_fetch(symbol: str, existing: dict | None) -> dict:
         entry = dict(existing or {})
         entry.setdefault('recent', [])
         entry.setdefault('upcoming', None)
-        entry['last_updated'] = entry.get('last_updated', _NEVER)
+        entry['last_updated'] = entry.get('last_updated', NEVER)
         entry['_error'] = str(exc)
         return entry

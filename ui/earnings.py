@@ -45,9 +45,12 @@ if outdated:
     st.session_state.earnings_store = store
 
 header_left, header_right = st.columns([4, 1])
+# Symbols that returned nothing keep the '2000-01-01' sentinel so they are retried
+# on the next load; including it here reported "Last refreshed Jan 01, 2000".
 updates = [
     date.fromisoformat(store[s]['last_updated'])
-    for s in symbols if s in store and store[s].get('last_updated')
+    for s in symbols
+    if s in store and store[s].get('last_updated', earnings_store.NEVER) != earnings_store.NEVER
 ]
 with header_left:
     if updates:
@@ -180,8 +183,9 @@ no_data = [
 ]
 if no_data:
     st.caption(
-        f'No earnings for {", ".join(no_data)} — ETFs, trusts and funds do not report '
-        'earnings, so this is expected for those.'
+        f'No earnings data for {", ".join(no_data)}. Expected for ETFs, trusts and '
+        'funds, which do not report earnings; for an operating company it usually '
+        'means the ticker has changed or the data source has no coverage.'
     )
 
 errors = {s: store[s]['_error'] for s in symbols if (store.get(s) or {}).get('_error')}

@@ -1,3 +1,7 @@
 -r requirements.txt
 
 pytest>=8.0.0
+
+# xlsxwriter only writes. Reading a generated workbook back — which is how the
+# Excel tests assert on it — needs a reader engine.
+openpyxl>=3.1.0

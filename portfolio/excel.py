@@ -298,7 +298,13 @@ def export_analytics_to_excel(consolidated_df, analytics_report, output=None):
         data_fmt = workbook.add_format({'border': 1, 'valign': 'top'})
 
         sheet = workbook.add_worksheet('Analytics Summary')
-        row = 0
+        # A real header row, so anything reading the sheet back (pandas, Excel's
+        # own filters) treats row 0 as column names instead of promoting the first
+        # section title into one.
+        sheet.write(0, 0, 'Metric', header_fmt)
+        sheet.write(0, 1, 'Value', header_fmt)
+
+        row = 1
         for section_name, section_data in (analytics_report or {}).items():
             sheet.write(row, 0, section_name, section_fmt)
             sheet.write(row, 1, '', section_fmt)

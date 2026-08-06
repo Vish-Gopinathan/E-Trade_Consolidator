@@ -165,14 +165,19 @@ def build_share_history(holdings_df, trades_df, splits: pd.DataFrame,
     account actually held on day ``d``.
     """
     held = current_shares(holdings_df)
-    traded = set(trades_df['Symbol'].dropna().unique()) - {''}
+    # An account with no trades in range yields a frame with no columns at all,
+    # so the Symbol column cannot be assumed to exist.
+    traded = set()
+    if trades_df is not None and not trades_df.empty and 'Symbol' in trades_df.columns:
+        traded = set(trades_df['Symbol'].dropna().unique()) - {''}
+
     symbols = sorted(set(held.index) | traded)
     if not symbols or len(index) == 0:
         return pd.DataFrame(index=index), pd.DataFrame(index=index)
 
     # Daily net quantity traded, signed (+ buy, − sell)
     q = pd.DataFrame(0.0, index=index, columns=symbols)
-    if not trades_df.empty:
+    if traded:
         t = trades_df[trades_df['Symbol'].isin(symbols)].copy()
         t['_day'] = pd.to_datetime(t['Date']).dt.normalize()
         pivot = t.pivot_table(index='_day', columns='Symbol', values='Quantity',
