@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from portfolio.storage.thesis import STATUS_EMOJI, STATUS_OPTIONS, get, load_all, save_stock
-from ui.common import STATUS_COLORS, page_header, require_portfolio
+from ui.common import page_header, require_portfolio
 
 page_header('Thesis Tracker', '🧠')
 

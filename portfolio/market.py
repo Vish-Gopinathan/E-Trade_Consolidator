@@ -4,7 +4,6 @@ Market data helpers used by other pages.
 Earnings data is now handled by lib/earnings_store.py.
 """
 
-from datetime import datetime
 import streamlit as st
 import yfinance as yf
 import pandas as pd

@@ -35,15 +35,20 @@ def _autofit(worksheet, df: pd.DataFrame, formats: dict | None = None) -> None:
     """
     Size every column to its widest value.
 
-    ``Series.map(len).max()`` returns NaN on an empty frame and ``set_column``
-    rejects NaN, so an empty sheet used to abort the whole export. Falls back to
-    the header width.
+    Two things this must survive, both of which have broken it:
+
+    * An **empty frame** — ``max()`` over nothing returns NaN and ``set_column``
+      rejects NaN, aborting the entire export rather than skipping one sheet.
+    * A **missing value**. ``astype(str).map(len)`` looks safe but is not: under
+      pandas' string dtype the NA survives ``astype(str)`` instead of becoming
+      ``'nan'``, and ``len`` is then handed a float. Measuring ``str(value)``
+      directly is correct on every dtype and pandas version.
     """
     formats = formats or {}
     for index, column in enumerate(df.columns):
         header_width = len(str(column))
         if len(df):
-            widest = df[column].astype(str).map(len).max()
+            widest = df[column].map(lambda value: len(str(value))).max()
             width = max(int(widest) if pd.notna(widest) else 0, header_width)
         else:
             width = header_width

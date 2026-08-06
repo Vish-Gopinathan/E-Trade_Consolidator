@@ -5,7 +5,11 @@ xlsxwriter>=3.2.9
 python-dotenv>=0.15.0
 streamlit>=1.36.0
 plotly>=5.0.0
-yfinance>=0.2.40
+# Upper bound because this code reads yfinance's response shapes in detail —
+# earnings_history column names, surprisePercent being a fraction, calendar being a
+# dict. Verified on 0.2.66 and 1.5.2; a future major could change any of them, and
+# the failure mode is empty data rather than an error.
+yfinance>=0.2.40,<2
 
 # yfinance parses the earnings-dates table with pandas.read_html, which needs a
 # parser backend. Without lxml, Ticker.get_earnings_dates() raises ImportError and

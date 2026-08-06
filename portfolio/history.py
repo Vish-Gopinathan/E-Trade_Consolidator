@@ -17,7 +17,7 @@ share count before the account existed. That residual is reported as a
 diagnostic rather than hidden (see ``residual_shares``).
 
 Everything is computed on **today's share basis**. Yahoo's historical closes are
-split-adjusted (see lib/price_store.py), so share counts have to be too: a trade
+split-adjusted (see portfolio/storage/prices.py), so share counts have to be too: a trade
 of 10 raw shares before a 10:1 split counts as 100 shares today, and pairing
 those 100 with the split-adjusted $122 close reproduces the same $1,224 the
 position was actually worth. ``shares`` therefore holds today-equivalent counts;
@@ -213,7 +213,8 @@ def reconstruct(portfolio: dict, trades_df, store, start: date, end: date,
         store: loaded price store dict.
         start, end: requested bounds (``end`` is clamped to the holdings anchor —
             there is nothing to reconstruct after the snapshot date).
-        price_module: lib.price_store (injected so this module stays import-light).
+        price_module: portfolio.storage.prices (injected to keep this module
+            import-light and testable without network access).
     """
     holdings_df = portfolio.get('holdings')
     transactions_df = portfolio.get('transactions')

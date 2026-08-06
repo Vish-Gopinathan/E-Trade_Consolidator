@@ -73,8 +73,7 @@ with flows_tab:
         fig = px.area(ordered, x='Date', y='Cumulative')
         fig.update_traces(
             line_color=colours['primary'], line_width=2,
-            fillcolor=f'rgba(42,120,214,0.12)' if not colours['dark']
-            else 'rgba(57,135,229,0.16)',
+            fillcolor='rgba(57,135,229,0.16)' if colours['dark'] else 'rgba(42,120,214,0.12)',
             hovertemplate='%{x|%b %d, %Y}<br>$%{y:,.0f} contributed to date<extra></extra>',
         )
         theme.apply_layout(fig, colours, y_prefix='$')
@@ -227,9 +226,7 @@ with review_tab:
                             account_map_store.INTERNAL if choice == 'My own account'
                             else account_map_store.EXTERNAL,
                         )
-                        st.success(
-                            f'Saved. Refresh from E\\*TRADE to apply it to the figures.'
-                        )
+                        st.success('Saved. Refresh from E\\*TRADE to apply it to the figures.')
                 st.markdown('---')
 
         if current_map:
