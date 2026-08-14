@@ -22,6 +22,7 @@ portfolio/     Data and logic
 ui/            Streamlit pages, chrome, chart theme
 config/        sectors.json — user-editable
 data/          Runtime state. Gitignored. Real financial data.
+               Includes ledger.db — the accumulating transaction store.
 tests/         pytest
 ```
 
@@ -61,7 +62,37 @@ explicit user download/upload.
 `except Exception: pass` around cache and snapshot writes made a failed save look
 identical to a successful one, so data vanished on restart. Log it and surface it.
 
-### 5. Fix the data, not the metric
+### 5. Transactions accumulate; they are never replaced
+
+`portfolio/storage/ledger.py` (SQLite, `data/ledger.db`) is the only transaction
+store that matters. Every other store is a snapshot written whole — correct for
+holdings, which describe today. It was wrong for transactions.
+
+E\*TRADE serves ~2 years and **the window slides forward with today's date**, so
+each refresh returns less old history than the last. Because the cache
+overwrote, the reported total deposited fell between two sessions with no
+withdrawal behind it — and a large share of all deposits sat within six months
+of the edge, so the figure was eroding steadily rather than once.
+
+- `merge()` unions and dedupes; it can add history but never remove it. A
+  narrower fetch window must never delete rows. `tests/test_ledger.py` guards
+  exactly this.
+- `merge()` seeds first, and seeding only fires on an empty table. Insert before
+  seeding and the pre-window rows in the old JSON stores are lost for good.
+- Dedupe on `Transaction ID` (E\*TRADE's `transactionId`), falling back to a
+  composite. **`Ref ID` is not a row id** — it identifies a transfer *pair*, so
+  both legs share one and most rows have none.
+- Rows carry `account_id_key`, not just the display name. The accounts have been
+  renamed; in an accumulating store a rename splits one account into two.
+
+### 6. Classification is derived, not stored
+
+Run `classify.classify_frame()` before `reconcile_transfers()` on anything read
+from the ledger. Rows carry the verdict the rules gave when they were written, so
+without re-deriving, a fix reaches only rows fetched afterwards and the same
+money is classified two ways depending on download date.
+
+### 7. Fix the data, not the metric
 
 When a demo fixture produces a nonsense figure, the fixture is usually wrong. The
 demo once claimed $1.33M of deposits against a $705k portfolio, and
