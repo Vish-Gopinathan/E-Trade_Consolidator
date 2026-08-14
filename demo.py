@@ -62,8 +62,10 @@ navigation = st.navigation({
         st.Page('ui/performance.py', title='Performance', icon='🎯'),
     ],
     'Money': [
+        st.Page('ui/reconciliation.py', title='Reconciliation', icon='🧾'),
         st.Page('ui/cash_flows.py', title='Cash Flows & Income', icon='💵'),
         st.Page('ui/transactions.py', title='Transactions', icon='🔄'),
+        st.Page('ui/backfill.py', title='Backfill', icon='📥'),
     ],
     'Research': [
         st.Page('ui/earnings.py', title='Earnings', icon='📅'),

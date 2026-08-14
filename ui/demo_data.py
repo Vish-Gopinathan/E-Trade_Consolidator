@@ -40,6 +40,11 @@ _CASH = 285_000.0  # dry powder — always keep a war chest
 # ── Sold positions (for What-If analysis) ─────────────────────────────────────
 # (date, symbol, description, qty, price_per_share)
 
+#: TSMC has no matching buy on purpose: it stands for a position transferred in
+#: from another broker before the history starts, which is the single most common
+#: reason a real account will not reconcile. Its proceeds are reported as having
+#: no cost basis rather than being treated as pure gain, and that path needs to
+#: render somewhere the app can be checked without live credentials.
 _SELLS = [
     ('2018-04-15', 'IBM',  'Intl Business Machines',  800,  145.00),
     ('2023-01-12', 'TSMC', 'Taiwan Semiconductor',    100,   83.00),
@@ -286,9 +291,15 @@ def _build_transactions() -> pd.DataFrame:
     # $705k portfolio, which is not a demo of anything — deposit-adjusted return
     # correctly reported -76%, because on those numbers the account really had
     # lost most of the money put into it.
+    # Sized so the reconciliation identity very nearly closes: deposits plus
+    # realised P&L plus income plus unrealised P&L should land just under the
+    # portfolio value, leaving a small positive residual that the transferred-in
+    # TSMC position explains. At $500k they overshot and the residual came out
+    # *negative* — recorded activity accounting for more than the account holds,
+    # which is not a demo of anything real.
     for d, amt in [
-        ('2010-01-15', 95_000), ('2012-03-20', 55_000), ('2015-06-10', 75_000),
-        ('2018-01-08', 115_000), ('2020-04-02', 95_000), ('2022-01-20', 65_000),
+        ('2010-01-15', 90_000), ('2012-03-20', 50_000), ('2015-06-10', 70_000),
+        ('2018-01-08', 110_000), ('2020-04-02', 90_000), ('2022-01-20', 55_000),
     ]:
         rows.append(_row(d, '', 'BROKERAGE DEPOSIT', 'Deposit', 'Deposit', None, None, float(amt)))
 
@@ -304,6 +315,13 @@ def _build_transactions() -> pd.DataFrame:
         'KHC':  [('2016-07-08', 450, 91.50)],
         'VRSN': [('2012-06-15', 20, 34.00)],
         'BK':   [('2010-09-15', 100, 23.80)],
+        # Bought and later sold in full — these give the sales in _SELLS a cost
+        # basis so realised P&L is a real number in demo mode. Without them the
+        # demo showed three of five sales as "no purchase on record", which
+        # exercises the missing-history path but makes the working path look
+        # broken. TSMC is deliberately left unbought; see _SELLS.
+        'IBM':  [('2011-03-10', 800, 120.00)],
+        'WFC':  [('2011-09-19', 500, 28.00)],
     }
     sym_to_desc = {sym: desc for sym, desc, *_ in _HOLDINGS}
     for sym, tranches in buys.items():

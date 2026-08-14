@@ -25,7 +25,7 @@ load_dotenv(paths.ROOT / '.env')
 
 from portfolio import analytics, classify, etrade, excel, schema  # noqa: E402
 from portfolio.storage import accounts as account_map_store       # noqa: E402
-from portfolio.storage import cache, snapshot                     # noqa: E402
+from portfolio.storage import cache, ledger, snapshot             # noqa: E402
 from ui.common import get_secret, is_guest, money, render_sidebar_status  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -246,10 +246,27 @@ def _refresh_data(start_date, end_date) -> None:
             progress.progress(1.0, text='All accounts fetched')
 
             frames = [f for f in frames if not f.empty]
-            transactions = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            fetched = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+            # Merge into the ledger *before* pass 2. E*TRADE's window slides
+            # forward, so this fetch is a subset of your history, not all of it;
+            # reconciling only what came back is how an internal transfer whose
+            # sibling leg aged out became a phantom deposit.
+            ledger.remember_accounts([
+                {
+                    'account_id_key': getattr(a, 'accountIdKey', None),
+                    'account_id': getattr(a, 'accountId', None),
+                    'account_name': getattr(a, 'accountName', None),
+                }
+                for a in accounts
+            ])
+            transactions = ledger.merge(fetched)
+
             if not transactions.empty:
+                # Pass 1 again over the whole ledger, not just this fetch: rows
+                # stored earlier carry the verdict the rules gave at the time.
                 transactions = classify.reconcile_transfers(
-                    transactions,
+                    classify.classify_frame(transactions),
                     own_accounts=active_accounts.get('accountId', pd.Series(dtype=str)).tolist(),
                     account_map=account_map_store.load(),
                 )
@@ -259,7 +276,14 @@ def _refresh_data(start_date, end_date) -> None:
             status.update(label='Failed to fetch transactions', state='error')
             st.error(f'Could not fetch transactions: {exc}')
             return
-        st.write(f'✅ {len(transactions):,} transaction(s)' + done('transactions'))
+
+        window = ledger.coverage()
+        st.write(
+            f'✅ {len(fetched):,} fetched · {len(transactions):,} in ledger '
+            f'({window["start"]} → {window["end"]})' + done('transactions')
+        )
+        if window['manual_rows']:
+            st.write(f'📥 including {window["manual_rows"]} hand-entered row(s)')
 
         st.write('🧮 Computing analytics…')
         try:
@@ -308,6 +332,7 @@ def _refresh_data(start_date, end_date) -> None:
         'analytics_report': report,
         'summary': summary,
         'reported_total': reported_total,
+        'transactions_coverage': ledger.coverage(),
         'account_balances': [
             {k: v for k, v in b.items() if k != 'raw_computed'} for b in balances
         ],
@@ -550,8 +575,10 @@ navigation = st.navigation({
         st.Page('ui/performance.py', title='Performance', icon='🎯'),
     ],
     'Money': [
+        st.Page('ui/reconciliation.py', title='Reconciliation', icon='🧾'),
         st.Page('ui/cash_flows.py', title='Cash Flows & Income', icon='💵'),
         st.Page('ui/transactions.py', title='Transactions', icon='🔄'),
+        st.Page('ui/backfill.py', title='Backfill', icon='📥'),
     ],
     'Research': [
         st.Page('ui/earnings.py', title='Earnings', icon='📅'),

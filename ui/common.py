@@ -134,6 +134,19 @@ def signed_money(value, decimals: int = 2) -> str:
     return f'{sign}${abs(number):,.{decimals}f}'
 
 
+def md(text: str) -> str:
+    """
+    Escape dollar signs for ``st.markdown`` and ``st.caption``.
+
+    Streamlit reads ``$…$`` as inline LaTeX, so a caption holding two amounts —
+    ``'$35,400 realised · $200,153 on paper'`` — renders everything between them
+    as a serif maths expression. One amount survives by luck because there is no
+    closing delimiter; two do not. Metric values and dataframe cells are not
+    markdown and need no escaping.
+    """
+    return (text or '').replace('$', r'\$')
+
+
 def percent(value, decimals: int = 2, signed: bool = False) -> str:
     """``12.34%``, or ``+12.34%`` when ``signed``. Em dash when missing."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
