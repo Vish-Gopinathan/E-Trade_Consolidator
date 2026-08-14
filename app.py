@@ -23,8 +23,10 @@ from portfolio import paths
 
 load_dotenv(paths.ROOT / '.env')
 
-from portfolio import analytics, classify, etrade, excel, schema  # noqa: E402
-from portfolio.storage import accounts as account_map_store       # noqa: E402
+# Classification and analytics moved behind portfolio.build, which is now the
+# only thing that assembles a portfolio dict — so the refresh and a rebuild
+# cannot produce differently-shaped results.
+from portfolio import build, etrade, excel, schema                # noqa: E402
 from portfolio.storage import cache, ledger, snapshot             # noqa: E402
 from ui.common import get_secret, is_guest, money, render_sidebar_status  # noqa: E402
 
@@ -262,16 +264,6 @@ def _refresh_data(start_date, end_date) -> None:
             ])
             transactions = ledger.merge(fetched)
 
-            if not transactions.empty:
-                # Pass 1 again over the whole ledger, not just this fetch: rows
-                # stored earlier carry the verdict the rules gave at the time.
-                transactions = classify.reconcile_transfers(
-                    classify.classify_frame(transactions),
-                    own_accounts=active_accounts.get('accountId', pd.Series(dtype=str)).tolist(),
-                    account_map=account_map_store.load(),
-                )
-                transactions = transactions.sort_values(
-                    'Date', ascending=False).reset_index(drop=True)
         except Exception as exc:
             status.update(label='Failed to fetch transactions', state='error')
             st.error(f'Could not fetch transactions: {exc}')
@@ -287,12 +279,13 @@ def _refresh_data(start_date, end_date) -> None:
 
         st.write('🧮 Computing analytics…')
         try:
-            cash_flows = classify.get_cash_flows(transactions)
-            income = classify.get_income(transactions)
-            report = analytics.PortfolioAnalytics(
-                holdings, transactions, cash_flows
-            ).generate_full_report()
-            summary = etrade.portfolio_summary(holdings, cash=cash)
+            portfolio = build.build_portfolio(
+                holdings, transactions, cash=cash, reported_total=reported_total,
+                account_balances=[
+                    {k: v for k, v in b.items() if k != 'raw_computed'} for b in balances
+                ],
+            )
+            report = portfolio['analytics_report']
         except Exception as exc:
             status.update(label='Failed to compute analytics', state='error')
             st.error(f'Could not compute analytics: {exc}')
@@ -323,20 +316,6 @@ def _refresh_data(start_date, end_date) -> None:
             )
         status.update(label='Portfolio data refreshed', state='complete', expanded=False)
 
-    portfolio = {
-        'fetched_at': datetime.datetime.now().isoformat(),
-        'holdings': holdings,
-        'transactions': transactions,
-        'cash_flows': cash_flows,
-        'income': income,
-        'analytics_report': report,
-        'summary': summary,
-        'reported_total': reported_total,
-        'transactions_coverage': ledger.coverage(),
-        'account_balances': [
-            {k: v for k, v in b.items() if k != 'raw_computed'} for b in balances
-        ],
-    }
     st.session_state.portfolio = portfolio
     st.session_state.pop('_is_snapshot', None)
 
@@ -538,8 +517,43 @@ def _render_sidebar() -> None:
         if st.button('🔄 Refresh data', type='primary', use_container_width=True):
             _refresh_data(start_date, end_date)
 
+    _render_rebuild()
     _render_snapshot_tools()
     _render_downloads()
+
+
+def _render_rebuild() -> None:
+    """
+    Recompute every figure from the ledger, without touching E*TRADE.
+
+    Holdings describe today and can only come from the broker, so they are
+    carried over from the last refresh. Everything derived from transactions is
+    recalculated. That is what makes a hand-entered backfill or a classification
+    fix visible without an OAuth round trip — and it is the only way to see data
+    at all on a host whose filesystem does not survive a restart.
+    """
+    if is_guest() or not st.session_state.get('portfolio'):
+        return
+
+    with st.expander('🧮 Rebuild from ledger'):
+        coverage = ledger.coverage()
+        st.caption(
+            f'{coverage["rows"]:,} transaction(s) on record, '
+            f'{coverage["start"]} → {coverage["end"]}. Recomputes deposits, '
+            'realised P&L and the reconciliation from the ledger. No E\\*TRADE '
+            'connection needed, and holdings are left as they were.'
+        )
+        if st.button('Rebuild', use_container_width=True):
+            try:
+                portfolio = build.rebuild_from_stored(st.session_state.portfolio)
+                cache.save_portfolio(portfolio)
+            except Exception as exc:
+                LOGGER.exception('rebuild from ledger failed')
+                st.error(f'Could not rebuild: {exc}')
+            else:
+                st.session_state.portfolio = portfolio
+                st.success('Rebuilt from the ledger.')
+                st.rerun()
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
