@@ -97,6 +97,89 @@ def test_online_transfer_is_in_the_vocabulary():
     assert 'Online Transfer' in classify.TRANSFER_TYPES
 
 
+# ── Contributions that are really transfers ───────────────────────────────────
+
+def test_a_contribution_from_your_own_account_is_internal_not_a_deposit():
+    """
+    The contribution/transfer double-count, in its original wording.
+
+    Funding an IRA from a taxable account is booked as a ``Contribution``, and
+    taking that at face value counted the same dollars twice — once arriving in
+    the taxable account, again "contributed" to the IRA. Both legs share a REFID;
+    only the ``Transfer`` leg used to reach pass 2, so one move came out
+    classified two different ways.
+    """
+    frame = make_frame([
+        row('2024-11-07', 'Online Transfer', 'TRANSFER TO XXXXX1607 REFID:121333885906',
+            -3500.0, account='Individual'),
+        row('2024-11-07', 'Contribution', 'TRANSFER FROM XXXXX1344 REFID:121333885906',
+            3500.0, account='Roth IRA'),
+    ])
+    result = classify.reconcile_transfers(frame)
+
+    assert set(result['Category']) == {classify.INTERNAL}
+    assert classify.get_cash_flows(result).empty, 'this money must not count as a deposit'
+
+
+def test_a_contribution_with_a_known_counterparty_resolves_without_its_sibling():
+    """The far leg can be outside the fetched window; the account number still tells us."""
+    frame = make_frame([
+        row('2025-01-27', 'Contribution', 'TRANSFER FROM XXXXX7449 REFID:128216868906',
+            775.0, account='Roth IRA'),
+    ])
+    result = classify.reconcile_transfers(frame, own_accounts=['1344', '7449', '1607'])
+    assert result['Category'].iloc[0] == classify.INTERNAL
+
+
+def test_a_contribution_arriving_by_ach_is_still_a_deposit():
+    """The repair must not turn genuine outside money into an internal move."""
+    frame = make_frame([
+        row('2024-06-14', 'Contribution', 'ACH DEPOSIT REFID:109902862906;', 1750.0),
+    ])
+    result = classify.reconcile_transfers(frame)
+    assert result['Category'].iloc[0] == classify.DEPOSIT
+
+
+def test_ira_contributions_are_read_from_the_tax_year_markers():
+    """
+    Sourced from E*TRADE's own $0.00 marker rows rather than from the category,
+    so the figure survives the cash row being reclassified as internal. Both
+    2024 and 2025 come to exactly the $7,000 annual limit on this account.
+    """
+    frame = make_frame([
+        row('2024-06-14', 'Contribution',
+            'TY 2024 $ 1750 INDIVID CONTRIB - CURR YR; FUNDS RECEIVED', 0.0),
+        row('2024-11-07', 'Contribution',
+            'TY 2024 $ 3500 INDIVID CONTRIB - CURR YR; RETIREMENT', 0.0),
+        row('2025-01-27', 'Contribution',
+            'TY 2025 $ 500 INDIVID CONTRIB - CURR YR; RETIREMENT', 0.0),
+        row('2024-08-19', 'Transfer', 'ACH DEPOSIT REFID:115053551906;', 15000.0),
+    ])
+    assert classify.ira_contributions_by_year(frame) == {'2024': 5250.0, '2025': 500.0}
+
+
+def test_a_description_with_no_tax_year_marker_contributes_nothing():
+    assert classify.parse_ira_contribution('ACH DEPOSIT REFID:109902862906;') is None
+    assert classify.parse_ira_contribution('') is None
+
+
+def test_classify_frame_re_derives_a_stale_category():
+    """
+    Ledger rows carry the verdict the rules gave when they were written. Without
+    recomputing, the repair above would only reach rows fetched after the change
+    and the same money would be counted two ways depending on download date.
+    """
+    frame = make_frame([
+        row('2024-11-07', 'Contribution', 'TRANSFER FROM XXXXX1344 REFID:121333885906',
+            3500.0, account='Roth IRA'),
+    ])
+    frame['Category'] = classify.DEPOSIT          # as an older version stored it
+
+    rederived = classify.classify_frame(frame)
+    assert rederived['Category'].iloc[0] == classify.PENDING_TRANSFER
+    assert rederived['Counterparty'].iloc[0] == '1344'
+
+
 # ── Pass 2 ────────────────────────────────────────────────────────────────────
 
 def test_paired_legs_become_internal():

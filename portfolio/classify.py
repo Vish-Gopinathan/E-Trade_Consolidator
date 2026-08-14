@@ -93,6 +93,13 @@ _COUNTERPARTY_RE = re.compile(r'\bTRANSFER\s+(?:TO|FROM)\s+X*(\d{4})\b', re.I)
 #: accounts. Always $0 in cash terms and never a cash flow.
 _IN_KIND_RE = re.compile(r'\bTFR\s+(?:TO|FROM)\s+ACCT\b', re.I)
 
+#: ``TY 2024 $ 1750 INDIVID CONTRIB`` -> ``('2024', 1750.0)``. The $0.00 marker
+#: row E*TRADE posts beside a retirement contribution, naming the tax year the
+#: money is designated for — which need not be the year it was paid.
+_IRA_CONTRIB_RE = re.compile(
+    r'\bTY\s+(\d{4})\s+\$\s*([\d,]+(?:\.\d{1,2})?)\s+INDIVID\s+CONTRIB', re.I
+)
+
 
 def parse_ref_id(description: str) -> str | None:
     """Return the REFID embedded in a description, or None."""
@@ -104,6 +111,47 @@ def parse_counterparty(description: str) -> str | None:
     """Return the masked counterparty account's last 4 digits, or None."""
     match = _COUNTERPARTY_RE.search(description or '')
     return match.group(1) if match else None
+
+
+def parse_ira_contribution(description: str):
+    """
+    Return ``(tax_year, dollars)`` for an IRA contribution marker, else None.
+
+    E*TRADE posts a $0.00 companion row alongside each retirement contribution
+    that names the tax year the money counts against::
+
+        TY 2024 $ 1750 INDIVID CONTRIB - CURR YR; FUNDS RECEIVED
+
+    That marker is worth reading separately from the cash row. A contribution
+    funded from your own taxable account is *internal* to this portfolio — it
+    must not count as a deposit — yet it is still a real contribution against
+    the annual IRS limit. Sourcing the figure from this text rather than from
+    the category means reclassifying the cash row does not lose it.
+
+    The tax year is not the posting date: a contribution made in January can be
+    designated for the previous year, which is exactly why E*TRADE states it.
+    """
+    match = _IRA_CONTRIB_RE.search(description or '')
+    if not match:
+        return None
+    try:
+        return match.group(1), float(match.group(2).replace(',', ''))
+    except (TypeError, ValueError):
+        return None
+
+
+def ira_contributions_by_year(transaction_df: pd.DataFrame) -> dict:
+    """Total IRA contributions per tax year, read from the marker rows."""
+    if transaction_df.empty or 'Security Name' not in transaction_df.columns:
+        return {}
+
+    totals = {}
+    for description in transaction_df['Security Name'].fillna(''):
+        parsed = parse_ira_contribution(description)
+        if parsed:
+            year, amount = parsed
+            totals[year] = round(totals.get(year, 0.0) + amount, 2)
+    return dict(sorted(totals.items()))
 
 
 # ── Pass 1: single-row classification ─────────────────────────────────────────
@@ -139,12 +187,23 @@ def classify_row(t_type: str, description: str, amount: float | None) -> str:
     if any(keyword in combined for keyword in _EXTERNAL_KEYWORDS):
         return direction_by_amount(amount)
 
-    # IRA contributions and distributions are directional by definition; E*TRADE
-    # reports contributions with inconsistent signs across account types.
-    if t_type == 'Contribution':
-        return DEPOSIT
-    if t_type == 'Distribution':
-        return WITHDRAWAL
+    # IRA contributions and distributions are directional by definition, because
+    # E*TRADE reports them with inconsistent signs across account types — but
+    # only once we know the money came from outside. Funding an IRA by moving
+    # cash from your own taxable account is booked as a ``Contribution`` too, and
+    # taking that at face value counted the same dollars twice: once arriving in
+    # the taxable account, again "contributed" to the IRA.
+    #
+    # A named counterparty is the tell, so hand those to pass 2 exactly as any
+    # other transfer. This was found on a real account: an IRA row reading
+    # ``TRANSFER FROM XXXXX1344 REFID:...`` and the taxable account's
+    # ``TRANSFER TO XXXXX1607`` under the *same* REFID were classified two
+    # different ways, because only the second ever reached the pairing logic —
+    # so several thousand dollars of one internal move counted as new money.
+    if t_type in ('Contribution', 'Distribution'):
+        if parse_counterparty(description):
+            return PENDING_TRANSFER
+        return DEPOSIT if t_type == 'Contribution' else WITHDRAWAL
 
     if t_type in EXTERNAL_CASH_TYPES:
         return direction_by_amount(amount)
@@ -167,6 +226,50 @@ def direction_by_amount(amount: float | None) -> str:
     if amount is None or pd.isna(amount):
         return OTHER
     return DEPOSIT if amount >= 0 else WITHDRAWAL
+
+
+def classify_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Re-derive ``Category`` for every row from that row's own fields (pass 1).
+
+    Classification is **derived** data, not stored fact. The transaction ledger
+    keeps a ``Category`` column so imported and hand-entered rows arrive with
+    one, but a row written months ago carries the verdict of whatever the rules
+    said back then. Recomputing on read is what lets a fix to
+    :func:`classify_row` reach history that is already on disk — without it, the
+    contribution/transfer repair would have corrected only rows fetched after
+    the change, leaving the same money counted two ways depending on when it
+    happened to be downloaded.
+
+    Trades are settled by transaction type and never consult the description,
+    which is why :func:`classify_row` does not handle them.
+    """
+    if df.empty or 'Transaction Type' not in df.columns:
+        return df
+
+    out = df.copy()
+    descriptions = out['Security Name'] if 'Security Name' in out.columns else ''
+    amounts = pd.to_numeric(out.get('Total Value'), errors='coerce')
+
+    categories = []
+    for t_type, description, amount in zip(
+        out['Transaction Type'].fillna(''),
+        descriptions if len(descriptions) else [''] * len(out),
+        amounts,
+    ):
+        if t_type in TRADE_TYPES:
+            categories.append(TRADE)
+        else:
+            categories.append(classify_row(t_type, description, amount))
+
+    out['Category'] = categories
+    # Re-parsed for the same reason: a row stored before these were captured
+    # would otherwise never gain a counterparty and never pair in pass 2.
+    out['Ref ID'] = [parse_ref_id(d) for d in (descriptions if len(descriptions) else [''] * len(out))]
+    out['Counterparty'] = [
+        parse_counterparty(d) for d in (descriptions if len(descriptions) else [''] * len(out))
+    ]
+    return out
 
 
 # ── Pass 2: cross-account reconciliation ──────────────────────────────────────
