@@ -29,10 +29,11 @@ INCOME = 'Income'
 HOLDINGS_QUALITY = 'Holdings Quality'
 LIQUIDITY = 'Liquidity'
 TRADING = 'Trading Activity'
+RECONCILIATION = 'Reconciliation'
 
 SECTIONS = (
     PERFORMANCE, CONCENTRATION, SECTORS, CASH_FLOWS,
-    INCOME, HOLDINGS_QUALITY, LIQUIDITY, TRADING,
+    INCOME, HOLDINGS_QUALITY, LIQUIDITY, TRADING, RECONCILIATION,
 )
 
 # ── Performance ───────────────────────────────────────────────────────────────
@@ -121,6 +122,52 @@ TOTAL_BOUGHT = 'Total Amount Bought'
 TOTAL_SOLD = 'Total Amount Sold'
 TURNOVER_PCT = 'Portfolio Turnover (%)'
 AVG_TRADE_SIZE = 'Avg Transaction Size'
+
+
+# ── Reconciliation ────────────────────────────────────────────────────────────
+#
+# The identity that ties the whole account together::
+#
+#     Portfolio Value = Net Deposits + Realised P&L + Income + Unrealised P&L
+#
+# Anything left over is money the transaction history cannot account for, and it
+# is reported rather than absorbed. E*TRADE serves about two years; an account
+# older than that has activity — an opening in-kind transfer, early deposits —
+# that simply is not in the feed.
+
+NET_DEPOSITS = 'Net Deposits'              # deposits less withdrawals
+REALIZED_GAINS = 'Realised Gains'          # positive lot outcomes only
+REALIZED_LOSSES = 'Realised Losses'        # negative, kept as a negative number
+REALIZED_NET = 'Realised P&L'
+REALIZED_BY_SYMBOL = 'Realised P&L by Symbol'
+UNREALIZED_GAINS = 'Unrealised Gains'      # winning positions only
+UNREALIZED_LOSSES = 'Unrealised Losses'    # negative, kept as a negative number
+RECONCILED_SUBTOTAL = 'Accounted For'
+UNEXPLAINED_RESIDUAL = 'Unexplained'
+HISTORY_STARTS = 'History Starts'
+
+#: Sells whose matching buy is not in the history. Their cost basis is unknown,
+#: so their profit is excluded from :data:`REALIZED_NET` rather than assumed —
+#: treating basis as zero would report the full proceeds as gain.
+UNMATCHED_SELL_COUNT = 'Sells Without Cost Basis'
+UNMATCHED_SELL_PROCEEDS = 'Proceeds Without Cost Basis'
+
+#: Bought, never sold, and not currently held — the position went somewhere the
+#: transaction feed does not explain.
+ORPHAN_LOTS = 'Unexplained Open Lots'
+
+#: How many rows were entered by hand rather than fetched. A figure resting
+#: partly on manual entry must say so.
+MANUAL_ROW_COUNT = 'Hand-Entered Rows'
+
+#: Contributions against the annual IRS limit, keyed by **tax year** — which is
+#: not the calendar year of payment, since a contribution made in January can be
+#: designated for the year before. Read from E*TRADE's own marker rows, so it
+#: survives the contribution being reclassified as an internal transfer.
+IRA_CONTRIBUTIONS_BY_YEAR = 'IRA Contributions by Tax Year'
+
+REALIZED_BASIS = 'Realised P&L Basis'
+RECONCILIATION_BASIS = 'Reconciliation Basis'
 
 
 def all_keys() -> set:

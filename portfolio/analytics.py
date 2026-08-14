@@ -79,10 +79,15 @@ class PortfolioAnalytics:
     """
 
     def __init__(self, consolidated_df, transactions_df=None, cash_flows_df=None,
-                 beginning_market_value=0.0):
+                 beginning_market_value=0.0, splits=None):
         from portfolio import classify  # local import keeps the module import-light
 
         self.beginning_market_value = float(beginning_market_value or 0.0)
+        #: ``{symbol: split_ratios}`` for realised P&L. Optional: fetching splits
+        #: needs the network, which this layer must not require. Absent, every
+        #: factor is 1.0 — correct for any symbol that has not split, and stated
+        #: in the basis string when it matters.
+        self.splits = splits or {}
         holdings = consolidated_df if consolidated_df is not None else pd.DataFrame()
         self.holdings = holdings[holdings['Symbol'] != 'CASH'].copy() if len(holdings) else holdings
         cash_rows = holdings[holdings['Symbol'] == 'CASH']['Market Value'] if len(holdings) else []
@@ -239,8 +244,13 @@ class PortfolioAnalytics:
                 schema.NET_CASH_FLOW: 0.0, schema.FLOWS_NEEDING_REVIEW: 0,
             }
 
-        deposits = flows[flows['Category'] == 'Deposit']['Total Value']
-        withdrawals = flows[flows['Category'] == 'Withdrawal']['Total Value']
+        # Zero-dollar rows are excluded from the counts but not the sums. E*TRADE
+        # posts a $0.00 marker row beside each retirement contribution naming the
+        # tax year; counting those made 27 deposits read as 34.
+        deposits = flows[(flows['Category'] == 'Deposit') & (flows['Total Value'] != 0)]['Total Value']
+        withdrawals = flows[
+            (flows['Category'] == 'Withdrawal') & (flows['Total Value'] != 0)
+        ]['Total Value']
         needs_review = (
             int(flows['Needs Review'].fillna(False).sum())
             if 'Needs Review' in flows.columns else 0
@@ -356,6 +366,144 @@ class PortfolioAnalytics:
             ),
         }
 
+    def reconciliation(self) -> dict:
+        """
+        Where the money came from, as an identity that must add up::
+
+            Portfolio Value = Net Deposits + Realised P&L + Income + Unrealised P&L
+
+        Every term is money that entered or was created inside the account, so
+        together they should reproduce the balance. Whatever is left over is
+        reported as :data:`~portfolio.schema.UNEXPLAINED_RESIDUAL` rather than
+        quietly folded into one of the others.
+
+        **The residual is a feature.** E*TRADE serves roughly two years of
+        transactions. An account older than that has activity the feed simply
+        does not contain — an opening in-kind transfer of securities is the
+        usual culprit, because those positions arrive with a cost basis but no
+        purchase to explain it. Forcing the identity closed would mean inventing
+        a number; naming the gap costs nothing and tells the truth.
+
+        The residual is computed as a plain subtraction from the portfolio value
+        so the displayed lines always sum to the total exactly, whatever
+        rounding does to the parts.
+        """
+        from portfolio import classify, realized as realized_module
+
+        positions_value = float(self.holdings['Market Value'].sum()) if len(self.holdings) else 0.0
+        cost_basis = float(self.holdings['Total Cost'].sum()) if len(self.holdings) else 0.0
+        portfolio_value = positions_value + self.cash
+
+        flows = self._signed_cash_flows()
+        net_deposits = float(flows['Total Value'].sum()) if not flows.empty else 0.0
+
+        income_total = 0.0
+        if self.income is not None and not self.income.empty:
+            income_total = float(
+                pd.to_numeric(self.income['Total Value'], errors='coerce').fillna(0).sum()
+            )
+
+        realized = realized_module.realized_pnl(
+            self.transactions,
+            splits=self.splits,
+            held_symbols=self.holdings['Symbol'] if len(self.holdings) else (),
+        )
+
+        gains, losses = self._unrealised_split()
+        subtotal = net_deposits + realized['net'] + income_total + (positions_value - cost_basis)
+
+        result = {
+            schema.NET_DEPOSITS: round(net_deposits, 2),
+            schema.REALIZED_GAINS: realized['gains'],
+            schema.REALIZED_LOSSES: realized['losses'],
+            schema.REALIZED_NET: realized['net'],
+            schema.REALIZED_BY_SYMBOL: realized['by_symbol'],
+            schema.UNREALIZED_GAINS: gains,
+            schema.UNREALIZED_LOSSES: losses,
+            schema.TOTAL_INCOME: round(income_total, 2),
+            schema.RECONCILED_SUBTOTAL: round(subtotal, 2),
+            schema.UNEXPLAINED_RESIDUAL: round(portfolio_value - subtotal, 2),
+            schema.TOTAL_PORTFOLIO_VALUE: round(portfolio_value, 2),
+            schema.UNMATCHED_SELL_COUNT: len(realized['unmatched']),
+            schema.UNMATCHED_SELL_PROCEEDS: realized['unmatched_proceeds'],
+            schema.ORPHAN_LOTS: realized['orphan_lots'],
+            schema.IRA_CONTRIBUTIONS_BY_YEAR: classify.ira_contributions_by_year(
+                self.transactions
+            ),
+            schema.HISTORY_STARTS: None,
+            schema.MANUAL_ROW_COUNT: 0,
+            schema.REALIZED_BASIS: self._realized_basis(realized),
+            schema.RECONCILIATION_BASIS: '',
+        }
+
+        if not self.transactions.empty and 'Date' in self.transactions.columns:
+            earliest = pd.to_datetime(self.transactions['Date'], errors='coerce').min()
+            if pd.notna(earliest):
+                result[schema.HISTORY_STARTS] = str(earliest.date())
+        if not self.transactions.empty and 'Source' in self.transactions.columns:
+            result[schema.MANUAL_ROW_COUNT] = int(
+                (~self.transactions['Source'].fillna('etrade').eq('etrade')).sum()
+            )
+
+        starts = result[schema.HISTORY_STARTS]
+        residual = result[schema.UNEXPLAINED_RESIDUAL]
+        # The sign matters and means opposite things. Positive: the account holds
+        # more than the records explain — money or securities arrived before the
+        # history began. Negative: the records account for more than is there,
+        # which points at missing withdrawals or an overstated gain, and is the
+        # more suspicious of the two.
+        if abs(residual) < 1:
+            explanation = 'Every dollar is accounted for by recorded activity.'
+        elif residual > 0:
+            explanation = (
+                f'${residual:,.0f} of the balance is not explained by activity on '
+                'record — most likely an opening transfer of securities, or '
+                'deposits, from before the history starts.'
+            )
+        else:
+            explanation = (
+                f'Recorded activity accounts for ${abs(residual):,.0f} more than the '
+                'account actually holds. That usually means withdrawals are missing '
+                'from the history, or a position left the account without a sale.'
+            )
+        result[schema.RECONCILIATION_BASIS] = (
+            f'Transaction history begins {starts}. ' if starts else 'No transaction history. '
+        ) + explanation
+        return result
+
+    def _unrealised_split(self) -> tuple:
+        """
+        Unrealised gain divided into the winning and losing halves.
+
+        Computed per position from ``Market Value - Total Cost`` rather than
+        read from a ``Total Gain`` column, matching :meth:`performance` — the
+        column is produced by a different module and need not be present.
+        """
+        if self.holdings is None or len(self.holdings) == 0:
+            return 0.0, 0.0
+        gain = (
+            pd.to_numeric(self.holdings['Market Value'], errors='coerce').fillna(0)
+            - pd.to_numeric(self.holdings['Total Cost'], errors='coerce').fillna(0)
+        )
+        return round(float(gain[gain > 0].sum()), 2), round(float(gain[gain < 0].sum()), 2)
+
+    @staticmethod
+    def _realized_basis(realized: dict) -> str:
+        """Plain-language statement of what the realised figure rests on."""
+        basis = (
+            f'FIFO matching over {realized["sell_count"]} sale(s); '
+            'shares are matched oldest-buy-first and adjusted for splits.'
+        )
+        if realized['unmatched']:
+            symbols = ', '.join(realized['unmatched'])
+            basis += (
+                f' {realized["unmatched_shares"]:,.0f} share(s) across {symbols} were '
+                f'sold with no purchase on record — ${realized["unmatched_proceeds"]:,.0f} '
+                'of proceeds whose cost basis is unknown and therefore excluded, '
+                'not assumed to be zero.'
+            )
+        return basis
+
     def generate_full_report(self) -> dict:
         """The complete report, keyed by the section constants in :mod:`portfolio.schema`."""
         return {
@@ -367,6 +515,7 @@ class PortfolioAnalytics:
             schema.HOLDINGS_QUALITY: self.holdings_quality(),
             schema.LIQUIDITY: self.liquidity(),
             schema.TRADING: self.trading_activity(),
+            schema.RECONCILIATION: self.reconciliation(),
         }
 
     # ── Internals ─────────────────────────────────────────────────────────────

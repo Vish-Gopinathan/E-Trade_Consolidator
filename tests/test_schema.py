@@ -42,6 +42,14 @@ def portfolio_frames():
         {'Date': pd.Timestamp('2024-07-01'), 'Security Name': 'ALPHA DIVIDEND',
          'Symbol': 'AAA', 'Quantity': None, 'Price': None, 'Total Value': 25.0,
          'Transaction Type': 'Dividend', 'Category': classify.INCOME},
+        # A closed round trip, so the reconciliation section has realised P&L to
+        # report rather than exercising only its empty path.
+        {'Date': pd.Timestamp('2024-02-01'), 'Security Name': 'BOUGHT CCC',
+         'Symbol': 'CCC', 'Quantity': 50.0, 'Price': 10.0, 'Total Value': 500.0,
+         'Transaction Type': 'Bought', 'Category': classify.TRADE},
+        {'Date': pd.Timestamp('2024-08-01'), 'Security Name': 'SOLD CCC',
+         'Symbol': 'CCC', 'Quantity': -50.0, 'Price': 13.0, 'Total Value': -650.0,
+         'Transaction Type': 'Sold', 'Category': classify.TRADE},
     ])
     return holdings, transactions
 
@@ -148,3 +156,85 @@ def test_no_cash_flows_leaves_the_adjusted_return_unset(portfolio_frames):
 def test_empty_portfolio_produces_a_full_report():
     report = analytics.PortfolioAnalytics(pd.DataFrame()).generate_full_report()
     assert set(report) == set(schema.SECTIONS)
+
+
+# ── The reconciliation identity ───────────────────────────────────────────────
+
+def test_the_reconciliation_lines_sum_to_the_portfolio_value(report):
+    """
+    The whole point of the section: what is displayed must add up. The residual
+    is a plain subtraction from the total precisely so rounding in the parts can
+    never leave the reader with five numbers that miss the sixth.
+    """
+    section = report[schema.RECONCILIATION]
+    parts = (
+        section[schema.NET_DEPOSITS]
+        + section[schema.REALIZED_NET]
+        + section[schema.TOTAL_INCOME]
+        + section[schema.UNREALIZED_GAINS]
+        + section[schema.UNREALIZED_LOSSES]
+        + section[schema.UNEXPLAINED_RESIDUAL]
+    )
+    assert parts == pytest.approx(section[schema.TOTAL_PORTFOLIO_VALUE], abs=0.01)
+
+
+def test_the_subtotal_and_residual_agree_with_the_total(report):
+    section = report[schema.RECONCILIATION]
+    assert (
+        section[schema.RECONCILED_SUBTOTAL] + section[schema.UNEXPLAINED_RESIDUAL]
+        == pytest.approx(section[schema.TOTAL_PORTFOLIO_VALUE], abs=0.01)
+    )
+
+
+def test_unrealised_gains_and_losses_are_split_not_netted(report):
+    """AAA is +$1,000 and BBB is -$200; a net of $800 would hide both."""
+    section = report[schema.RECONCILIATION]
+    assert section[schema.UNREALIZED_GAINS] == 1000.0
+    assert section[schema.UNREALIZED_LOSSES] == -200.0
+
+
+def test_realised_pnl_reaches_the_report(report):
+    """CCC: 50 shares bought at $10, sold at $13."""
+    section = report[schema.RECONCILIATION]
+    assert section[schema.REALIZED_NET] == pytest.approx(150.0)
+    assert section[schema.REALIZED_GAINS] == pytest.approx(150.0)
+    assert section[schema.UNMATCHED_SELL_COUNT] == 0
+
+
+def test_a_sale_without_a_purchase_is_flagged_in_the_report(portfolio_frames):
+    """The residual must absorb it, and the count must say so."""
+    holdings, transactions = portfolio_frames
+    orphan = pd.DataFrame([{
+        'Date': pd.Timestamp('2024-09-01'), 'Security Name': 'SOLD DDD',
+        'Symbol': 'DDD', 'Quantity': -10.0, 'Price': 50.0, 'Total Value': -500.0,
+        'Transaction Type': 'Sold', 'Category': classify.TRADE,
+    }])
+    combined = pd.concat([transactions, orphan], ignore_index=True)
+    section = analytics.PortfolioAnalytics(
+        holdings, combined
+    ).generate_full_report()[schema.RECONCILIATION]
+
+    assert section[schema.UNMATCHED_SELL_COUNT] == 1
+    assert section[schema.UNMATCHED_SELL_PROCEEDS] == pytest.approx(500.0)
+    # Excluded from realised P&L, not treated as $500 of pure profit.
+    assert section[schema.REALIZED_NET] == pytest.approx(150.0)
+
+
+def test_deposit_count_ignores_zero_dollar_marker_rows(portfolio_frames):
+    """
+    E*TRADE posts a $0.00 row beside each retirement contribution naming the tax
+    year. Counting those inflated the deposit count by a third.
+    """
+    holdings, transactions = portfolio_frames
+    # Appended by rebuilding rather than concatenating an all-NA frame, which
+    # pandas deprecates because the result dtypes are about to change.
+    combined = pd.DataFrame(transactions.to_dict('records') + [{
+        'Date': pd.Timestamp('2024-01-02'),
+        'Security Name': 'TY 2024 $ 1750 INDIVID CONTRIB - CURR YR; FUNDS RECEIVED',
+        'Symbol': '', 'Quantity': None, 'Price': None, 'Total Value': 0.0,
+        'Transaction Type': 'Contribution', 'Category': classify.DEPOSIT,
+    }])
+    flows = analytics.PortfolioAnalytics(holdings, combined).cash_flows_summary()
+
+    assert flows[schema.DEPOSIT_COUNT] == 1, 'the $0.00 marker is not a deposit'
+    assert flows[schema.TOTAL_DEPOSITED] == 2000.0
