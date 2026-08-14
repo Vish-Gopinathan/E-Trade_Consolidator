@@ -8,6 +8,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 
+from portfolio import realized
+
 
 @st.cache_data(ttl=300)
 def get_current_prices(symbols: tuple) -> dict:
@@ -47,19 +49,8 @@ def get_split_history(symbols: tuple) -> dict:
     return result
 
 
-def cumulative_split_factor(splits_series, since_date) -> float:
-    """
-    Product of all split ratios that occurred AFTER since_date.
-    Returns 1.0 when there are no splits.
-    """
-    if splits_series is None or (hasattr(splits_series, 'empty') and splits_series.empty):
-        return 1.0
-    try:
-        since_ts = pd.Timestamp(since_date)
-        idx = splits_series.index
-        if idx.tz is not None:
-            idx = idx.tz_localize(None)
-        after = splits_series[idx > since_ts]
-        return float(after.prod()) if not after.empty else 1.0
-    except Exception:
-        return 1.0
+#: Re-exported from :mod:`portfolio.realized`, which owns the implementation.
+#: The logic layer must not import streamlit, so the pure split arithmetic lives
+#: there and this module — which is cached by Streamlit — borrows it, rather
+#: than the two drifting apart with a copy each.
+cumulative_split_factor = realized.cumulative_split_factor
