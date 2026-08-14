@@ -67,6 +67,119 @@ def test_re_merging_the_same_fetch_changes_nothing():
     assert ledger.coverage()['rows'] == 1
 
 
+# ── The other way it lost: counting the same money twice ──────────────────────
+#
+# dedup_key returns ``etrade:{id}`` when a transaction id is present and a
+# composite otherwise, so the two forms never collide. A row seeded from the old
+# JSON stores keyed on the composite; the same transaction fetched later keyed on
+# its id. Nothing stopped both landing, and the first real refresh after the
+# ledger shipped roughly doubled the reported deposits.
+
+
+def test_a_fetched_row_claims_its_id_less_twin():
+    ledger.merge(pd.DataFrame([_row('2024-06-14', 1750.0, txn_id=None)]))
+    ledger.merge(pd.DataFrame([_row('2024-06-14', 1750.0, txn_id='555')]))
+
+    frame = ledger.load()
+    assert len(frame) == 1, 'the same deposit must not be stored twice'
+    assert frame['Transaction ID'].iloc[0] == '555', 'the broker id should be adopted'
+
+
+def test_a_cent_of_drift_still_counts_as_the_same_event():
+    """
+    A statement records the settled amount while the API recomputes quantity x
+    price, and a value that round-tripped through JSON can differ from a freshly
+    fetched one in the last float bit — enough to round two identical numbers
+    apart. Exact keys cannot survive that; the match is tolerant by design.
+    """
+    ledger.merge(pd.DataFrame([_row(
+        '2024-06-07', -26.78, txn_id=None,
+        **{'Symbol': 'TLRY', 'Quantity': 15.0, 'Transaction Type': 'Bought'},
+    )]))
+    ledger.merge(pd.DataFrame([_row(
+        '2024-06-07', 26.775, txn_id='777',
+        **{'Symbol': 'TLRY', 'Quantity': 15.0, 'Transaction Type': 'Bought'},
+    )]))
+    assert ledger.coverage()['rows'] == 1
+
+
+def test_a_day_of_drift_still_counts_as_the_same_event():
+    """Deposit notes record the day money was sent; E*TRADE records when it posted."""
+    ledger.add_manual([_row('2025-10-30', 5000.0, account='Brokerage')])
+    ledger.merge(pd.DataFrame([_row('2025-10-29', 5000.0, txn_id='888', account='Brokerage')]))
+    assert ledger.coverage()['rows'] == 1
+
+
+def test_a_hand_entered_row_cannot_duplicate_a_row_that_has_an_id():
+    """
+    The mirror case. Once E*TRADE starts serving a period you backfilled, a
+    hand-entered row has no id to collide on, so it must be matched economically
+    or the same money is counted twice.
+    """
+    ledger.merge(pd.DataFrame([_row('2025-03-17', 5000.0, txn_id='999')]))
+    assert ledger.add_manual([_row('2025-03-17', 5000.0)]) == 0
+    assert ledger.coverage()['rows'] == 1
+
+
+def test_zero_dollar_rows_are_never_matched_economically():
+    """
+    An in-kind transfer and a tax-year marker both post $0.00 with no symbol and
+    no quantity, so they are indistinguishable on the matched fields — six can
+    share one date and account. They move no money, so a duplicate cannot
+    distort a total, but collapsing them loses the record of what happened.
+    """
+    rows = [
+        _row('2024-11-05', 0.0, txn_id=f'{i}',
+             **{'Security Name': f'{sym} TFR TO ACCT XXXXX-2222-0'})
+        for i, sym in enumerate(['CRWD', 'NVDA', 'LULU', 'SCHD', 'VPU', 'SLYG'])
+    ]
+    ledger.merge(pd.DataFrame(rows))
+    assert ledger.coverage()['rows'] == 6
+
+
+def test_two_real_trades_on_one_day_are_not_collapsed():
+    """Economically identical but distinct — the broker's ids say so."""
+    buy = {'Symbol': 'AAA', 'Quantity': 10.0, 'Transaction Type': 'Bought'}
+    ledger.merge(pd.DataFrame([
+        _row('2025-03-17', 1000.0, txn_id='a', **buy),
+        _row('2025-03-17', 1000.0, txn_id='b', **buy),
+    ]))
+    assert ledger.coverage()['rows'] == 2
+
+
+# ── Repairing a ledger written before the fix ─────────────────────────────────
+
+def test_reconcile_collapses_pairs_and_keeps_orphans():
+    ledger.merge(pd.DataFrame([
+        _row('2024-06-14', 1750.0, txn_id=None),      # has a twin below
+        _row('2024-08-19', 15000.0, txn_id=None),     # window slid past it: keep
+    ]))
+    # Write the twin straight to the table. Going through _insert would exercise
+    # the fix and adopt the id-less row, which is the opposite of the pre-fix
+    # state this test needs to start from.
+    with ledger._connect() as connection:
+        connection.execute(
+            'INSERT INTO transactions (dedup_key, txn_id, date, total_value, '
+            'account_name, source, created_at) VALUES (?,?,?,?,?,?,?)',
+            ('etrade:555', '555', '2024-06-14', 1750.0, 'Brokerage',
+             ledger.SOURCE_ETRADE, '2026-01-01T00:00:00'),
+        )
+        connection.commit()
+    assert ledger.coverage()['rows'] == 3
+
+    preview = ledger.reconcile_duplicates(dry_run=True)
+    assert (preview['removed'], preview['kept']) == (1, 1)
+    assert ledger.coverage()['rows'] == 3, 'a dry run must not change anything'
+
+    ledger.reconcile_duplicates(dry_run=False)
+    assert ledger.coverage()['rows'] == 2
+    remaining = ledger.load()
+    assert 15000.0 in remaining['Total Value'].tolist(), 'the orphan must survive'
+
+    # Re-running finds nothing left to do.
+    assert ledger.reconcile_duplicates(dry_run=False)['removed'] == 0
+
+
 # ── Dedup identity ────────────────────────────────────────────────────────────
 
 def test_rows_without_a_transaction_id_dedupe_on_their_contents():

@@ -136,8 +136,14 @@ def dedup_key(row: dict) -> str:
     E*TRADE's own ``transactionId`` is the real key. Rows that predate its
     capture — anything seeded from the old JSON cache — and every hand-entered
     row fall back to a composite of the fields that identify a transaction
-    economically. That fallback is what stops a seeded row and a freshly fetched
-    copy of the same transaction from both landing.
+    economically.
+
+    **The two keys never collide, which is a trap.** A transaction seeded from
+    the old cache keys on the composite; the *same* transaction fetched later
+    keys on ``etrade:{id}``. Nothing stops both landing, and on the first real
+    refresh after the ledger shipped that doubled the reported deposits.
+    :func:`_adopt_legacy` closes it: a row arriving with a transaction id first
+    looks for an existing id-less row describing the same event and claims it.
     """
     txn_id = _clean_text(row.get('Transaction ID'))
     if txn_id:
@@ -313,20 +319,145 @@ def _insert(rows, source: str) -> int:
 
     # No bare except around the write: a save that fails silently is how data
     # vanished on restart before, so a failure here must reach the caller.
+    inserted = 0
     with _connect() as connection:
-        before = connection.total_changes
-        connection.executemany(
-            """
-            INSERT OR IGNORE INTO transactions (
-                dedup_key, txn_id, date, security_name, symbol, quantity, price,
-                total_value, txn_type, category, account_name, account_id_key,
-                account_last4, ref_id, counterparty, source, note, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            payload,
-        )
+        for values, row in zip(payload, records):
+            # A row carrying a transaction id may already be here under an
+            # id-less key, from the JSON stores or a hand-entered backfill. Claim
+            # that row rather than adding a second copy of the same money.
+            if values[1]:
+                if _adopt_legacy(connection, row, values[1]):
+                    continue
+            elif _already_present(connection, row):
+                continue
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO transactions (
+                    dedup_key, txn_id, date, security_name, symbol, quantity, price,
+                    total_value, txn_type, category, account_name, account_id_key,
+                    account_last4, ref_id, counterparty, source, note, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                values,
+            )
+            inserted += connection.total_changes - before
         connection.commit()
-        return connection.total_changes - before
+    return inserted
+
+
+#: How far a hand-entered date may sit from the broker's posting date and still
+#: describe the same event. Deposit notes record the day money was *sent*;
+#: E*TRADE records the day it posted, which is often the next business day.
+_DATE_SLACK_DAYS = 3
+
+#: Amounts are compared with a tolerance rather than as a rounded key. The same
+#: transaction can differ in the last cent between sources — a statement records
+#: the settled amount while the API recomputes quantity x price — and a value
+#: that round-tripped through JSON can differ from a freshly fetched one in the
+#: final float bit, which is enough to make two identical numbers round apart.
+_AMOUNT_SLACK = 0.011
+
+
+def _economic_twin(connection, account, date, symbol, quantity, amount, id_less_only: bool):
+    """
+    An existing row describing the same event, or None.
+
+    Matching is deliberately tolerant on date and amount but strict on account,
+    symbol and quantity. Those three make a trade unmistakable; date and amount
+    are exactly the fields that legitimately drift between a statement, a
+    hand-typed note and the API.
+
+    **Zero-dollar rows are never matched.** An in-kind security transfer and an
+    IRA tax-year marker both post $0.00 with no symbol and no quantity, so they
+    are indistinguishable on these fields — six of them can share one date and
+    account. What separates them is the description, which the composite dedup
+    key already covers. They move no money, so a duplicate cannot distort a
+    total, whereas collapsing them loses the record of what happened.
+    """
+    if abs(amount or 0.0) < 0.005:
+        return None
+
+    candidates = connection.execute(
+        f"""
+        SELECT id, total_value, quantity, symbol, txn_id FROM transactions
+        WHERE account_name IS ?
+          AND date BETWEEN date(?, ?) AND date(?, ?)
+          {'AND txn_id IS NULL' if id_less_only else ''}
+        """,
+        (account or None, date, f'-{_DATE_SLACK_DAYS} days',
+         date, f'+{_DATE_SLACK_DAYS} days'),
+    ).fetchall()
+
+    for candidate in candidates:
+        if _clean_text(candidate['symbol']) != _clean_text(symbol):
+            continue
+        theirs = candidate['quantity']
+        if (quantity is None) != (theirs is None):
+            continue
+        if quantity is not None and abs(abs(quantity) - abs(theirs)) > 1e-6:
+            continue
+        if abs(abs(amount or 0.0) - abs(candidate['total_value'] or 0.0)) > _AMOUNT_SLACK:
+            continue
+        return candidate
+    return None
+
+
+def _row_identity(row: dict) -> tuple:
+    """The fields :func:`_economic_twin` compares, pulled off an incoming row."""
+    return (
+        _clean_text(row.get('Account')),
+        _iso_date(row.get('Date')),
+        _clean_text(row.get('Symbol')),
+        _as_float(row.get('Quantity')),
+        _as_float(row.get('Total Value')) or 0.0,
+    )
+
+
+def _adopt_legacy(connection, row: dict, txn_id: str) -> bool:
+    """
+    Claim an existing id-less row for the same event, so it is not duplicated.
+
+    Returns True when the caller must **not** insert — either because this
+    transaction id is already stored, or because an id-less row describing the
+    same event has just been updated to carry it.
+
+    Only id-less rows are claimed. Two genuinely distinct transactions can look
+    economically identical — the same stock bought twice in a day — and E*TRADE
+    distinguishes them by id, so a row that already has one is left alone.
+    """
+    if connection.execute(
+        'SELECT 1 FROM transactions WHERE txn_id = ?', (txn_id,)
+    ).fetchone():
+        return True     # already here under its own id; nothing to claim
+
+    twin = _economic_twin(connection, *_row_identity(row), id_less_only=True)
+    if twin is None:
+        return False
+
+    # Take the broker's id, but leave `source` alone: a hand-entered row stays
+    # visibly hand-entered even once E*TRADE starts serving the same event.
+    connection.execute(
+        'UPDATE transactions SET txn_id = ?, dedup_key = ? WHERE id = ?',
+        (txn_id, f'etrade:{txn_id}', twin['id']),
+    )
+    return True
+
+
+def _already_present(connection, row: dict) -> bool:
+    """
+    Whether an id-less incoming row is already accounted for.
+
+    The mirror of :func:`_adopt_legacy`. A hand-entered or imported row has no
+    id to match on, so it is compared economically against everything already
+    stored — including rows that *do* carry an id. Without this, backfilling a
+    period E*TRADE later starts serving would count the same money twice.
+
+    When two entries genuinely are indistinguishable this errs towards not
+    adding the second. Under-adding is visible — the backfill page reports what
+    it skipped — whereas double-counted money is not.
+    """
+    return _economic_twin(connection, *_row_identity(row), id_less_only=False) is not None
 
 
 def _to_records(rows) -> list:
@@ -347,6 +478,84 @@ def _as_float(value):
     except (TypeError, ValueError):
         return None
     return None if pd.isna(number) else number
+
+
+def reconcile_duplicates(dry_run: bool = True) -> dict:
+    """
+    Collapse id-less rows that a later fetch has since supplied with an id.
+
+    Repairs ledgers written before :func:`_adopt_legacy` existed, when a seeded
+    row and its freshly fetched twin keyed differently and both survived. Safe to
+    re-run: once a pair is collapsed there is nothing left to match.
+
+    Rows with **no** fresh twin are kept, and that is the important half. A
+    deposit that has already fallen out of E*TRADE's two-year window exists only
+    as an id-less row, and deleting it would undo the very thing this module was
+    built to prevent.
+
+    Args:
+        dry_run: Report what would be removed without touching anything.
+
+    Returns:
+        ``{'removed': n, 'kept': n, 'rows': [...]}`` — ``rows`` describes each
+        id-less row and whether a twin was found, so the caller can show its
+        working before committing.
+    """
+    with _connect() as connection:
+        legacy = connection.execute(
+            'SELECT * FROM transactions WHERE txn_id IS NULL ORDER BY date'
+        ).fetchall()
+
+        removed, kept, report = 0, 0, []
+        for row in legacy:
+            twin = _find_fresh_twin(connection, row)
+            entry = {
+                'id': row['id'], 'date': row['date'], 'account': row['account_name'],
+                'type': row['txn_type'], 'amount': row['total_value'],
+                'symbol': row['symbol'], 'source': row['source'],
+                'twin': twin['id'] if twin else None,
+            }
+            report.append(entry)
+            if twin is None:
+                kept += 1
+                continue
+            removed += 1
+            if not dry_run:
+                connection.execute('DELETE FROM transactions WHERE id = ?', (row['id'],))
+        if not dry_run:
+            connection.commit()
+
+    return {'removed': removed, 'kept': kept, 'rows': report}
+
+
+def _find_fresh_twin(connection, row):
+    """The id-carrying row describing the same event as ``row``, if any."""
+    candidates = connection.execute(
+        """
+        SELECT id, total_value, quantity, symbol FROM transactions
+        WHERE txn_id IS NOT NULL
+          AND account_name IS ?
+          AND date BETWEEN date(?, ?) AND date(?, ?)
+        """,
+        (row['account_name'], row['date'], f'-{_DATE_SLACK_DAYS} days',
+         row['date'], f'+{_DATE_SLACK_DAYS} days'),
+    ).fetchall()
+
+    quantity = row['quantity']
+    amount = row['total_value'] or 0.0
+    for candidate in candidates:
+        if _clean_text(candidate['symbol']) != _clean_text(row['symbol']):
+            continue
+        if (quantity is None) != (candidate['quantity'] is None):
+            continue
+        if quantity is not None and abs(abs(quantity) - abs(candidate['quantity'])) > 1e-6:
+            continue
+        if abs(abs(amount) - abs(candidate['total_value'] or 0.0)) > _AMOUNT_SLACK:
+            continue
+        return candidate
+    return None
+
+
 
 
 def update_row(ledger_id: int, **fields) -> None:
