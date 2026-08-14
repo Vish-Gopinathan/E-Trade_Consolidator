@@ -213,9 +213,18 @@ def _write_cash_flows(writer, cash_flows_df, workbook, header_fmt,
         fmt = deposit_fmt if row.get('Category') == 'Deposit' else withdrawal_fmt
         worksheet.write(offset, value_column, float(value), fmt)
 
+    # Signs normalised the way analytics normalises them, rather than trusting
+    # what E*TRADE sent. `deposits + withdrawals` is only a net if withdrawals
+    # arrive negative, and they do not always: one that came through positive
+    # would be *added* to net cash flow here while correctly subtracting on the
+    # Cash Flows page — the same money, two answers, in the same refresh.
+    from portfolio import classify
+
     amounts = pd.to_numeric(cash_flows_df['Total Value'], errors='coerce')
-    deposits = float(amounts[cash_flows_df['Category'] == 'Deposit'].sum())
-    withdrawals = float(amounts[cash_flows_df['Category'] == 'Withdrawal'].sum())
+    is_withdrawal = cash_flows_df['Category'] == classify.WITHDRAWAL
+    is_deposit = cash_flows_df['Category'] == classify.DEPOSIT
+    deposits = float(amounts[is_deposit].abs().sum())
+    withdrawals = -float(amounts[is_withdrawal].abs().sum())
 
     total_fmt = workbook.add_format({'bold': True, 'bg_color': '#E6F2FF', 'border': 1})
     total_currency_fmt = workbook.add_format({

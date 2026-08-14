@@ -49,16 +49,27 @@ with flows_tab:
         frame['Date'] = pd.to_datetime(frame['Date'], errors='coerce')
         frame['Total Value'] = pd.to_numeric(frame['Total Value'], errors='coerce').fillna(0)
 
+        # Read the report and nothing else. The old fallback partitioned by the
+        # *sign* of the amount while the report partitions by *category*, so the
+        # two disagreed on any row whose sign contradicted its classification —
+        # and `.get(key, default)` returns None rather than the default when the
+        # key is present and null, so the fallback fired less often than it looked.
         flow_summary = report.get(schema.CASH_FLOWS, {})
-        deposited = flow_summary.get(schema.TOTAL_DEPOSITED,
-                                     frame[frame['Total Value'] > 0]['Total Value'].sum())
-        withdrawn = flow_summary.get(schema.TOTAL_WITHDRAWN,
-                                     abs(frame[frame['Total Value'] < 0]['Total Value'].sum()))
+        deposited = flow_summary.get(schema.TOTAL_DEPOSITED) or 0.0
+        withdrawn = flow_summary.get(schema.TOTAL_WITHDRAWN) or 0.0
 
         m1, m2, m3 = st.columns(3)
         m1.metric('Deposited', money(deposited, 0))
         m2.metric('Withdrawn', money(withdrawn, 0))
         m3.metric('Net contributed', money(deposited - withdrawn, 0))
+
+        coverage = portfolio.get('transactions_coverage') or {}
+        if coverage.get('start'):
+            st.caption(
+                f'Covers {coverage["start"]} → {coverage["end"]}. E\\*TRADE serves about '
+                'two years; anything earlier is only here because the ledger kept it. '
+                'See **Reconciliation** for what the history cannot account for.'
+            )
 
         if needs_review:
             st.warning(

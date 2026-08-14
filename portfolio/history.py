@@ -131,16 +131,29 @@ def daily_cash_flow(transactions_df, index: pd.DatetimeIndex) -> pd.Series:
 
 
 def net_contributions(transactions_df, index: pd.DatetimeIndex) -> pd.Series:
-    """Cumulative external money in minus money out (deposits/withdrawals only)."""
+    """
+    Cumulative external money in minus money out (deposits/withdrawals only).
+
+    Signs are normalised the same way :meth:`portfolio.analytics.PortfolioAnalytics
+    ._signed_cash_flows` normalises them, because E*TRADE is not consistent about
+    them. This used to trust the raw sign, so a withdrawal that arrived positive
+    *added* to contributions here while correctly subtracting in analytics — two
+    pages, two answers, no way to tell which was wrong.
+    """
+    from portfolio import classify
+
     contrib = pd.Series(0.0, index=index)
     if transactions_df is None or transactions_df.empty or 'Category' not in transactions_df.columns:
         return contrib
     df = transactions_df.copy()
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df = df[df['Date'].notna() & df['Category'].isin(['Deposit', 'Withdrawal'])]
+    df = df[df['Date'].notna() & df['Category'].isin(classify.EXTERNAL_CATEGORIES)]
     if df.empty:
         return contrib
     df['Total Value'] = pd.to_numeric(df['Total Value'], errors='coerce').fillna(0.0)
+    withdrawals = df['Category'] == classify.WITHDRAWAL
+    df.loc[withdrawals, 'Total Value'] = -df.loc[withdrawals, 'Total Value'].abs()
+    df.loc[~withdrawals, 'Total Value'] = df.loc[~withdrawals, 'Total Value'].abs()
     daily = df.groupby(df['Date'].dt.normalize())['Total Value'].sum()
     return contrib.add(daily.reindex(index).fillna(0.0), fill_value=0.0).cumsum()
 
