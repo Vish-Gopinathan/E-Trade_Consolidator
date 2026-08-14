@@ -407,7 +407,8 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
 
     Columns:
         Date, Security Name, Symbol, Quantity, Price, Total Value,
-        Transaction Type, Category, Account, Ref ID, Counterparty.
+        Transaction Type, Category, Account, Ref ID, Counterparty,
+        Transaction ID.
 
     ``Category`` may be :data:`~portfolio.classify.PENDING_TRANSFER` — those rows
     are only resolvable once every account has been fetched. Use
@@ -471,6 +472,10 @@ def get_consolidated_transactions(accounts_obj, account_id_key, start_date, end_
             'Account': label,
             'Ref ID': classify.parse_ref_id(description),
             'Counterparty': classify.parse_counterparty(description),
+            # Kept as text and carried through so the ledger can dedupe on it.
+            # ``Ref ID`` cannot serve that purpose: it identifies a transfer
+            # *pair*, so both legs share one value and most rows have none.
+            'Transaction ID': str(transaction.get('transactionId') or '') or None,
         }
 
         if t_type in classify.TRADE_TYPES:
