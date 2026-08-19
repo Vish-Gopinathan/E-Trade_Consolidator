@@ -345,28 +345,39 @@ Cloud has no `.env`. Put the same keys in *Settings → Secrets*:
 CONSUMER_KEY = "..."
 CONSUMER_SECRET = "..."
 APP_PASSWORD_HASH = "..."
+SUPABASE_DB_URL = "postgresql://..."
 ```
 
-### Cold starts refetch everything
+Use the **session pooler** connection string, not the direct one. Supabase serves
+direct connections over IPv6 only and Streamlit Cloud is IPv4, so a direct string
+works from a laptop and fails on Cloud — which is a miserable way to find out.
+Strip the `[ ]` around the password: they are placeholder markers, not part of
+the value, and leaving them in makes the URL unparseable.
 
-Cloud gives every container a fresh filesystem, and `data/` is gitignored. So on
-each restart — and Cloud restarts apps that go idle — the app starts with **no
-cache at all**:
+### Cold starts, and what survives one
 
-| Missing | Consequence |
-|---|---|
-| `portfolio_cache.json` | Opens with no data; needs an E\*TRADE refresh |
-| `earnings_store.json` | Earnings refetches every symbol (seconds) |
-| `price_store.json` | Value Over Time rebuilds all daily prices (slower) |
-| `month_end_snapshot.json` | Guests see nothing |
+Cloud gives every container a fresh filesystem and `data/` is gitignored, so
+everything stored locally is gone on each restart — and Cloud restarts apps that
+go idle. What that costs depends on whether a database is configured:
 
-This is the deliberate cost of not writing portfolio data to the repository, which
-is public. The replacement is manual: **Save as snapshot → Export snapshot file**
-while the container is warm, then **Restore** after a restart. Keep that file
-somewhere you control.
+| Store | Without `SUPABASE_DB_URL` | With it |
+|---|---|---|
+| Transaction ledger | **Lost** — including anything hand-entered | Persists |
+| Holdings snapshot | Lost; needs an E\*TRADE refresh | Persists |
+| `earnings_store.json` | Refetches every symbol (seconds) | Same |
+| `price_store.json` | Rebuilds all daily prices (slower) | Same |
 
-If you would rather not do that dance, run the app locally — `data/` persists
-there and cold starts are instant.
+**Deploy without a database and the ledger does not survive.** Transactions
+accumulate precisely because E\*TRADE stops serving them after about two years,
+and anything entered by hand to cover that gap exists nowhere else. Losing it is
+not a slow reload, it is data gone for good.
+
+With a database, the app opens on stored numbers with no E\*TRADE round trip.
+The price and earnings stores stay local by choice — bulky, refetchable, and
+Yahoo serves them without authentication, so they buy nothing by travelling.
+
+`portfolio/storage/db.py` decides: a connection string means Postgres, no
+connection string means local SQLite and nothing changes.
 
 ### Round trips cost more from Cloud
 

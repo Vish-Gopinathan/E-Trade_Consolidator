@@ -76,8 +76,13 @@ def fetch_symbol(symbol: str, existing: dict | None = None) -> dict:
     Fetch one symbol's earnings, merged with what is already stored.
 
     Already-known quarters are preserved rather than re-fetched. ``last_updated``
-    advances only when something was actually retrieved, so a failed fetch is
-    retried on the next page load instead of caching itself as fresh.
+    advances when the fetch *completed*, not when it happened to return rows —
+    a clean fetch that finds nothing is an answer, not a gap.
+
+    That distinction matters because an ETF has no EPS to report and never will.
+    Advancing only on data left every ETF permanently stale, so all eight held
+    here were re-fetched on every single page load, and a first load on a host
+    with no stored file paid for all of them before rendering anything.
     """
     existing = existing or {}
     result = {
@@ -123,7 +128,11 @@ def fetch_symbol(symbol: str, existing: dict | None = None) -> dict:
     except Exception as exc:
         errors.append(f'calendar: {exc}')
 
-    if result['recent'] or result['upcoming']:
+    result['has_earnings'] = bool(result['recent'] or result['upcoming'])
+    if result['has_earnings'] or not errors:
+        # Either we got data, or we asked cleanly and there is none to get.
+        # Only a genuine failure leaves the timestamp behind, so that alone is
+        # retried on the next load rather than cached as though it were fresh.
         result['last_updated'] = date.today().isoformat()
     if errors:
         result['_error'] = '; '.join(errors)

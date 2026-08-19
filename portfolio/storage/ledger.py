@@ -659,7 +659,7 @@ def delete_row(ledger_id: int) -> None:
     """Remove one hand-entered row. Broker rows cannot be deleted."""
     with _connect() as connection:
         row = connection.execute(
-            'SELECT source FROM transactions WHERE id = ?', (ledger_id,)
+            db.q('SELECT source FROM transactions WHERE id = ?'), (ledger_id,)
         ).fetchone()
         if row is None:
             return
@@ -694,9 +694,9 @@ def remember_accounts(accounts: list) -> None:
             db.q("""
             INSERT INTO accounts (account_id_key, account_last4, account_name, updated_at)
             VALUES (?,?,?,?)
-            ON CONFLICT(account_id_key) DO UPDATE SET
-                account_last4 = COALESCE(excluded.account_last4, account_last4),
-                account_name  = COALESCE(excluded.account_name, account_name),
+            ON CONFLICT (account_id_key) DO UPDATE SET
+                account_last4 = COALESCE(excluded.account_last4, accounts.account_last4),
+                account_name  = COALESCE(excluded.account_name, accounts.account_name),
                 updated_at    = excluded.updated_at
             """),
             [

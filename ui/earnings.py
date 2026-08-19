@@ -113,6 +113,21 @@ if upcoming:
 else:
     st.info('No upcoming earnings dates found for these holdings.')
 
+# Funds have no EPS to report, so their absence is an answer rather than a gap.
+# Saying so stops the page reading as broken when a third of the portfolio is
+# missing from both tables.
+without = sorted(
+    s for s in symbols
+    if (store.get(s) or {}).get('has_earnings') is False
+)
+if without:
+    st.caption(
+        f'{len(without)} holding(s) do not report earnings — '
+        + ', '.join(without)
+        + '. Funds and trusts have no EPS, so they are absent from both tables '
+          'by nature, not because a fetch failed.'
+    )
+
 st.markdown('---')
 
 # ── History ───────────────────────────────────────────────────────────────────
