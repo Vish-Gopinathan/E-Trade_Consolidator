@@ -19,3 +19,7 @@ lxml>=5.0.0
 # starlette 1.4 changed GZipResponder.__init__, which Streamlit subclasses —
 # every page request 500s under it. Remove the ceiling once Streamlit adapts.
 starlette<1.4
+
+# Only needed when SUPABASE_DB_URL points the ledger at Postgres. Without it the
+# app falls back to the local SQLite file and everything still works.
+psycopg[binary]>=3.1

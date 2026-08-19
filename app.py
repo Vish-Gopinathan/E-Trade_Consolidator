@@ -27,7 +27,7 @@ load_dotenv(paths.ROOT / '.env')
 # only thing that assembles a portfolio dict — so the refresh and a rebuild
 # cannot produce differently-shaped results.
 from portfolio import build, etrade, excel, schema                # noqa: E402
-from portfolio.storage import cache, ledger, snapshot             # noqa: E402
+from portfolio.storage import cache, holdings_store, ledger, snapshot  # noqa: E402
 from ui.common import get_secret, is_guest, money, render_sidebar_status  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -318,6 +318,17 @@ def _refresh_data(start_date, end_date) -> None:
 
     st.session_state.portfolio = portfolio
     st.session_state.pop('_is_snapshot', None)
+
+    try:
+        # Beside the ledger, so a host that loses its filesystem on restart can
+        # still open with real positions instead of an E*TRADE login prompt.
+        holdings_store.save(
+            portfolio['holdings'], portfolio['fetched_at'],
+            portfolio['reported_total'], portfolio['account_balances'],
+        )
+    except Exception as exc:
+        LOGGER.exception('holdings store write failed')
+        st.warning(f'Holdings could not be saved to the database: {exc}')
 
     try:
         cache.save_portfolio(portfolio)

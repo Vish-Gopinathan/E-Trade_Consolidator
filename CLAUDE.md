@@ -22,7 +22,7 @@ portfolio/     Data and logic
 ui/            Streamlit pages, chrome, chart theme
 config/        sectors.json — user-editable
 data/          Runtime state. Gitignored. Real financial data.
-               Includes ledger.db — the accumulating transaction store.
+               Includes ledger.db — the local transaction store (see rule 3).
 tests/         pytest
 ```
 
@@ -49,13 +49,30 @@ the whole Performance page rendered em dashes — while demo mode looked correct
 because the demo fixtures happened to use the page's spelling. Demo data now runs
 through the real engine for the same reason.
 
-### 3. Never write portfolio data to a remote
+### 3. Never write portfolio data anywhere world-readable
 
 The GitHub repository is **public**. An earlier version pushed snapshots, the
 earnings store and the price store there through the Contents API, which bypasses
 `.gitignore`. Holdings, cost basis and full transaction history would have been
-world-readable. All persistence is local disk. Snapshots move between machines by
-explicit user download/upload.
+world-readable.
+
+That is the rule, and it is about *readability by strangers*, not about the data
+leaving the machine. A **credentialed database is permitted** for the two stores
+that cannot be rebuilt — the transaction ledger and the holdings snapshot — with
+the connection string in `.env` or Streamlit secrets and never in the repo. See
+`portfolio/storage/db.py`; no credentials configured means local SQLite, and the
+test suite runs that way.
+
+This was forced by hosting: a container gets a fresh filesystem on every restart,
+`data/` is gitignored, and the ledger holds transactions E*TRADE will not serve
+again. A store that dies with the container is not a store.
+
+The price and earnings stores stay local. They are bulky, refetchable, and Yahoo
+serves them without authentication, so they buy nothing by travelling.
+
+`tests/conftest.py` pins every test to local SQLite. Without it, `etrade.py`'s
+import-time `load_dotenv()` put a real connection string in the environment and a
+test run wrote fixture rows into the live database.
 
 ### 4. Do not swallow exceptions
 
@@ -64,7 +81,7 @@ identical to a successful one, so data vanished on restart. Log it and surface i
 
 ### 5. Transactions accumulate; they are never replaced
 
-`portfolio/storage/ledger.py` (SQLite, `data/ledger.db`) is the only transaction
+`portfolio/storage/ledger.py` is the only transaction
 store that matters. Every other store is a snapshot written whole — correct for
 holdings, which describe today. It was wrong for transactions.
 

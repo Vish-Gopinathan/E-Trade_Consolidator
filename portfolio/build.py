@@ -98,14 +98,19 @@ def rebuild_from_stored(portfolio: dict = None) -> dict:
     Raises:
         ValueError: when there is no stored portfolio to take holdings from.
     """
-    from portfolio.storage import cache, snapshot
+    from portfolio.storage import cache, holdings_store, snapshot
 
+    # The holdings store first: it sits beside the ledger, so on a host whose
+    # filesystem does not survive a restart it is the only one of these that is
+    # still there. The JSON cache and snapshot remain as local fallbacks.
     if portfolio is None:
-        portfolio = cache.load_portfolio()
+        portfolio = holdings_store.load()
+        if not portfolio:
+            portfolio = cache.load_portfolio()
         if not portfolio and snapshot.exists():
             portfolio = snapshot.load()
     if not portfolio:
-        raise ValueError('no stored portfolio to rebuild from — refresh from E*TRADE first')
+        raise ValueError('no stored holdings to rebuild from — refresh from E*TRADE first')
 
     holdings = portfolio.get('holdings')
     if holdings is None or (hasattr(holdings, 'empty') and holdings.empty):
