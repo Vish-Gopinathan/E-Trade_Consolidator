@@ -19,24 +19,26 @@ transfer legs by REFID, so when one leg aged out of the window the survivor fell
 through to "external" and an internal transfer became a phantom deposit. Both
 legs now stay present.
 
-**SQLite, not JSON.** ``INSERT OR IGNORE`` against a ``UNIQUE`` dedup key makes a
-re-merge idempotent at the storage layer rather than in pandas; manual backfill
-rows need stable ids to be editable and a ``source`` column to stay honest about
-provenance; and typed columns remove the ``'1607'`` -> ``1607.0`` coercion that
-:mod:`portfolio.storage.cache` carries ``_TEXT_COLUMNS`` to defend against.
+**A database, not JSON.** ``ON CONFLICT ... DO NOTHING`` against a ``UNIQUE``
+dedup key makes a re-merge idempotent at the storage layer rather than in
+pandas; manual backfill rows need stable ids to be editable and a ``source``
+column to stay honest about provenance; and typed columns remove the
+``'1607'`` -> ``1607.0`` coercion that :mod:`portfolio.storage.cache` carries
+``_TEXT_COLUMNS`` to defend against.
 
-Local disk only. This is holdings and cash-flow data and the repository is
-public; ``data/`` is gitignored and nothing here reaches a remote.
+Local SQLite by default, Postgres when one is configured — see
+:mod:`portfolio.storage.db`. Neither is world-readable: ``data/`` is gitignored
+and the connection string lives only in secrets.
 """
 
 import datetime
 import json
 import logging
-import sqlite3
 
 import pandas as pd
 
 from portfolio import paths
+from portfolio.storage import db
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,43 +64,6 @@ FRAME_COLUMNS = [
     'Transaction ID', 'Account ID Key', 'Account Last4', 'Source', 'Note',
 ]
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS transactions (
-    id              INTEGER PRIMARY KEY,
-    dedup_key       TEXT    NOT NULL UNIQUE,
-    txn_id          TEXT,
-    date            TEXT    NOT NULL,
-    security_name   TEXT,
-    symbol          TEXT,
-    quantity        REAL,
-    price           REAL,
-    total_value     REAL,
-    txn_type        TEXT,
-    category        TEXT,
-    account_name    TEXT,
-    account_id_key  TEXT,
-    account_last4   TEXT,
-    ref_id          TEXT,
-    counterparty    TEXT,
-    source          TEXT    NOT NULL,
-    note            TEXT,
-    created_at      TEXT    NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
-
-CREATE TABLE IF NOT EXISTS accounts (
-    account_id_key  TEXT PRIMARY KEY,
-    account_last4   TEXT,
-    account_name    TEXT,
-    updated_at      TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
 
 #: Maps a ledger column onto the DataFrame column the app uses.
 _COLUMN_MAP = {
@@ -113,13 +78,27 @@ _COLUMN_MAP = {
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
-def _connect() -> sqlite3.Connection:
-    """Open the ledger, creating the file and schema on first use."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.executescript(_SCHEMA)
-    return connection
+#: Targets whose schema has already been created, so the check is paid once
+#: rather than on every read — against a remote database it is a round trip.
+#: Keyed by target rather than a single flag: tests point DB_PATH at a fresh
+#: file per case, and a global flag left every one of them without tables.
+_schema_ready = set()
+
+
+def _connect():
+    """
+    Open the ledger, creating the schema on first use.
+
+    Delegates to :mod:`portfolio.storage.db`, which decides between the local
+    file and Postgres.
+    """
+    target = 'remote' if db.is_remote() else str(DB_PATH)
+    if not db.is_remote():
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if target not in _schema_ready:
+        db.ensure_schema(DB_PATH)
+        _schema_ready.add(target)
+    return db.connect(DB_PATH)
 
 
 # ── Dedup identity ────────────────────────────────────────────────────────────
@@ -288,62 +267,143 @@ def add_manual(rows, source: str = SOURCE_MANUAL) -> int:
 
 
 def _insert(rows, source: str) -> int:
-    """Insert rows, skipping any whose dedup key is already present."""
+    """
+    Insert rows, skipping anything already accounted for.
+
+    Reads the existing table **once** and does all matching in memory. The
+    obvious shape — a lookup per incoming row — costs two queries per row, which
+    is unnoticeable against a local file and roughly fifteen minutes against a
+    database across the network. Migrating 466 rows timed out that way.
+
+    Rows accepted during this call join the in-memory set immediately, so a
+    batch containing its own duplicates behaves exactly as if the rows had
+    arrived one at a time.
+    """
     records = _to_records(rows)
     if not records:
         return 0
 
     now = datetime.datetime.now().isoformat(timespec='seconds')
-    payload = []
-    for row in records:
-        payload.append((
-            dedup_key(row),
-            _clean_text(row.get('Transaction ID')) or None,
-            _iso_date(row.get('Date')),
-            _clean_text(row.get('Security Name')) or None,
-            _clean_text(row.get('Symbol')) or None,
-            _as_float(row.get('Quantity')),
-            _as_float(row.get('Price')),
-            _as_float(row.get('Total Value')),
-            _clean_text(row.get('Transaction Type')) or None,
-            _clean_text(row.get('Category')) or None,
-            _clean_text(row.get('Account')) or None,
-            _clean_text(row.get('Account ID Key')) or None,
-            _clean_text(row.get('Account Last4')) or None,
-            _clean_text(row.get('Ref ID')) or None,
-            _clean_text(row.get('Counterparty')) or None,
-            row.get('Source') or source,
-            _clean_text(row.get('Note')) or None,
-            now,
-        ))
 
     # No bare except around the write: a save that fails silently is how data
     # vanished on restart before, so a failure here must reach the caller.
-    inserted = 0
     with _connect() as connection:
-        for values, row in zip(payload, records):
-            # A row carrying a transaction id may already be here under an
-            # id-less key, from the JSON stores or a hand-entered backfill. Claim
-            # that row rather than adding a second copy of the same money.
-            if values[1]:
-                if _adopt_legacy(connection, row, values[1]):
+        existing = [
+            dict(r) for r in connection.execute(
+                'SELECT id, txn_id, dedup_key, account_name, date, symbol, '
+                'quantity, total_value FROM transactions'
+            ).fetchall()
+        ]
+        known_ids = {r['txn_id'] for r in existing if r['txn_id']}
+        known_keys = {r['dedup_key'] for r in existing}
+
+        payload, adoptions = [], []
+        for row in records:
+            key = dedup_key(row)
+            txn_id = _clean_text(row.get('Transaction ID')) or None
+
+            if txn_id:
+                if txn_id in known_ids:
+                    continue                      # already here under its own id
+                twin = _match(existing, row, id_less_only=True)
+                if twin is not None:
+                    # Claim the id-less row rather than adding a second copy of
+                    # the same money, and stop it being claimed twice.
+                    adoptions.append((txn_id, f'etrade:{txn_id}', twin['id']))
+                    twin['txn_id'] = txn_id
+                    known_ids.add(txn_id)
                     continue
-            elif _already_present(connection, row):
-                continue
-            before = connection.total_changes
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO transactions (
+            else:
+                if key in known_keys or _match(existing, row, id_less_only=False):
+                    continue
+
+            values = (
+                key, txn_id, _iso_date(row.get('Date')),
+                _clean_text(row.get('Security Name')) or None,
+                _clean_text(row.get('Symbol')) or None,
+                _as_float(row.get('Quantity')),
+                _as_float(row.get('Price')),
+                _as_float(row.get('Total Value')),
+                _clean_text(row.get('Transaction Type')) or None,
+                _clean_text(row.get('Category')) or None,
+                _clean_text(row.get('Account')) or None,
+                _clean_text(row.get('Account ID Key')) or None,
+                _clean_text(row.get('Account Last4')) or None,
+                _clean_text(row.get('Ref ID')) or None,
+                _clean_text(row.get('Counterparty')) or None,
+                row.get('Source') or source,
+                _clean_text(row.get('Note')) or None,
+                now,
+            )
+            payload.append(values)
+            known_keys.add(key)
+            if txn_id:
+                known_ids.add(txn_id)
+            # Visible to the rest of this batch, exactly as a committed row.
+            existing.append({
+                'id': None, 'txn_id': txn_id, 'dedup_key': key,
+                'account_name': values[10], 'date': values[2], 'symbol': values[4],
+                'quantity': values[5], 'total_value': values[7],
+            })
+
+        if adoptions:
+            db.executemany(
+                connection,
+                db.q('UPDATE transactions SET txn_id = ?, dedup_key = ? WHERE id = ?'),
+                adoptions,
+            )
+        if payload:
+            # ON CONFLICT DO NOTHING rather than SQLite's INSERT OR IGNORE: both
+            # accept it, and it is the last line of defence if two rows in one
+            # batch share a key.
+            db.executemany(
+                connection,
+                db.q("""
+                INSERT INTO transactions (
                     dedup_key, txn_id, date, security_name, symbol, quantity, price,
                     total_value, txn_type, category, account_name, account_id_key,
                     account_last4, ref_id, counterparty, source, note, created_at
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                values,
+                ON CONFLICT (dedup_key) DO NOTHING
+                """),
+                payload,
             )
-            inserted += connection.total_changes - before
-        connection.commit()
-    return inserted
+    return len(payload)
+
+
+def _match(existing, row, id_less_only: bool):
+    """
+    The stored row describing the same event as ``row``, or None.
+
+    In-memory twin of the SQL matcher, so a batch costs one read rather than one
+    query per row. The comparison rules are shared with :func:`_same_event`.
+    """
+    account, date, symbol, quantity, amount = _row_identity(row)
+    if abs(amount or 0.0) < 0.005:
+        return None
+    low, high = _date_window(date)
+    for candidate in existing:
+        if id_less_only and candidate['txn_id']:
+            continue
+        if (candidate['account_name'] or '') != (account or ''):
+            continue
+        if not (low <= (candidate['date'] or '') <= high):
+            continue
+        if _same_event(candidate, symbol, quantity, amount):
+            return candidate
+    return None
+
+
+def _same_event(candidate, symbol, quantity, amount) -> bool:
+    """Whether a stored row and these fields describe one transaction."""
+    if _clean_text(candidate['symbol']) != _clean_text(symbol):
+        return False
+    theirs = candidate['quantity']
+    if (quantity is None) != (theirs is None):
+        return False
+    if quantity is not None and abs(abs(quantity) - abs(theirs)) > 1e-6:
+        return False
+    return abs(abs(amount or 0.0) - abs(candidate['total_value'] or 0.0)) <= _AMOUNT_SLACK
 
 
 #: How far a hand-entered date may sit from the broker's posting date and still
@@ -357,6 +417,19 @@ _DATE_SLACK_DAYS = 3
 #: that round-tripped through JSON can differ from a freshly fetched one in the
 #: final float bit, which is enough to make two identical numbers round apart.
 _AMOUNT_SLACK = 0.011
+
+
+def _date_window(date: str) -> tuple:
+    """
+    The inclusive date range a match may fall in, as plain strings.
+
+    Computed here rather than in SQL because SQLite spells it ``date(?, '-3
+    days')`` and Postgres ``?::date - interval '3 days'``. Doing the arithmetic
+    in Python leaves no dialect-specific expression in the query at all.
+    """
+    anchor = pd.Timestamp(date)
+    slack = pd.Timedelta(days=_DATE_SLACK_DAYS)
+    return (anchor - slack).strftime('%Y-%m-%d'), (anchor + slack).strftime('%Y-%m-%d')
 
 
 def _economic_twin(connection, account, date, symbol, quantity, amount, id_less_only: bool):
@@ -379,14 +452,13 @@ def _economic_twin(connection, account, date, symbol, quantity, amount, id_less_
         return None
 
     candidates = connection.execute(
-        f"""
+        db.q(f"""
         SELECT id, total_value, quantity, symbol, txn_id FROM transactions
         WHERE account_name IS ?
-          AND date BETWEEN date(?, ?) AND date(?, ?)
+          AND date BETWEEN ? AND ?
           {'AND txn_id IS NULL' if id_less_only else ''}
-        """,
-        (account or None, date, f'-{_DATE_SLACK_DAYS} days',
-         date, f'+{_DATE_SLACK_DAYS} days'),
+        """),
+        (account or None, *_date_window(date)),
     ).fetchall()
 
     for candidate in candidates:
@@ -427,7 +499,7 @@ def _adopt_legacy(connection, row: dict, txn_id: str) -> bool:
     distinguishes them by id, so a row that already has one is left alone.
     """
     if connection.execute(
-        'SELECT 1 FROM transactions WHERE txn_id = ?', (txn_id,)
+        db.q('SELECT 1 FROM transactions WHERE txn_id = ?'), (txn_id,)
     ).fetchone():
         return True     # already here under its own id; nothing to claim
 
@@ -438,7 +510,7 @@ def _adopt_legacy(connection, row: dict, txn_id: str) -> bool:
     # Take the broker's id, but leave `source` alone: a hand-entered row stays
     # visibly hand-entered even once E*TRADE starts serving the same event.
     connection.execute(
-        'UPDATE transactions SET txn_id = ?, dedup_key = ? WHERE id = ?',
+        db.q('UPDATE transactions SET txn_id = ?, dedup_key = ? WHERE id = ?'),
         (txn_id, f'etrade:{txn_id}', twin['id']),
     )
     return True
@@ -521,9 +593,8 @@ def reconcile_duplicates(dry_run: bool = True) -> dict:
                 continue
             removed += 1
             if not dry_run:
-                connection.execute('DELETE FROM transactions WHERE id = ?', (row['id'],))
-        if not dry_run:
-            connection.commit()
+                connection.execute(
+                    db.q('DELETE FROM transactions WHERE id = ?'), (row['id'],))
 
     return {'removed': removed, 'kept': kept, 'rows': report}
 
@@ -531,14 +602,13 @@ def reconcile_duplicates(dry_run: bool = True) -> dict:
 def _find_fresh_twin(connection, row):
     """The id-carrying row describing the same event as ``row``, if any."""
     candidates = connection.execute(
-        """
+        db.q("""
         SELECT id, total_value, quantity, symbol FROM transactions
         WHERE txn_id IS NOT NULL
           AND account_name IS ?
-          AND date BETWEEN date(?, ?) AND date(?, ?)
-        """,
-        (row['account_name'], row['date'], f'-{_DATE_SLACK_DAYS} days',
-         row['date'], f'+{_DATE_SLACK_DAYS} days'),
+          AND date BETWEEN ? AND ?
+        """),
+        (row['account_name'], *_date_window(row['date'])),
     ).fetchall()
 
     quantity = row['quantity']
@@ -573,17 +643,16 @@ def update_row(ledger_id: int, **fields) -> None:
     assignments = ', '.join(f'{column} = ?' for column in updates)
     with _connect() as connection:
         row = connection.execute(
-            'SELECT source FROM transactions WHERE id = ?', (ledger_id,)
+            db.q('SELECT source FROM transactions WHERE id = ?'), (ledger_id,)
         ).fetchone()
         if row is None:
             raise KeyError(f'no ledger row with id {ledger_id}')
         if row['source'] == SOURCE_ETRADE:
             raise ValueError('E*TRADE rows are immutable; only manual rows can be edited')
         connection.execute(
-            f'UPDATE transactions SET {assignments} WHERE id = ?',
+            db.q(f'UPDATE transactions SET {assignments} WHERE id = ?'),
             (*updates.values(), ledger_id),
         )
-        connection.commit()
 
 
 def delete_row(ledger_id: int) -> None:
@@ -596,8 +665,8 @@ def delete_row(ledger_id: int) -> None:
             return
         if row['source'] == SOURCE_ETRADE:
             raise ValueError('E*TRADE rows are immutable; only manual rows can be deleted')
-        connection.execute('DELETE FROM transactions WHERE id = ?', (ledger_id,))
-        connection.commit()
+        connection.execute(
+            db.q('DELETE FROM transactions WHERE id = ?'), (ledger_id,))
 
 
 # ── Account identity ──────────────────────────────────────────────────────────
@@ -620,15 +689,16 @@ def remember_accounts(accounts: list) -> None:
         return
     now = datetime.datetime.now().isoformat(timespec='seconds')
     with _connect() as connection:
-        connection.executemany(
-            """
+        db.executemany(
+            connection,
+            db.q("""
             INSERT INTO accounts (account_id_key, account_last4, account_name, updated_at)
             VALUES (?,?,?,?)
             ON CONFLICT(account_id_key) DO UPDATE SET
                 account_last4 = COALESCE(excluded.account_last4, account_last4),
                 account_name  = COALESCE(excluded.account_name, account_name),
                 updated_at    = excluded.updated_at
-            """,
+            """),
             [
                 (
                     _clean_text(a.get('account_id_key')),
@@ -639,7 +709,6 @@ def remember_accounts(accounts: list) -> None:
                 for a in accounts if _clean_text(a.get('account_id_key'))
             ],
         )
-        connection.commit()
 
 
 def known_accounts() -> dict:
@@ -657,7 +726,8 @@ def known_accounts() -> dict:
 def get_meta(key: str, default=None):
     """Read one metadata value."""
     with _connect() as connection:
-        row = connection.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+        row = connection.execute(
+            db.q('SELECT value FROM meta WHERE key = ?'), (key,)).fetchone()
     if row is None:
         return default
     try:
@@ -670,11 +740,10 @@ def set_meta(key: str, value) -> None:
     """Write one metadata value."""
     with _connect() as connection:
         connection.execute(
-            'INSERT INTO meta (key, value) VALUES (?,?) '
-            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            db.q('INSERT INTO meta (key, value) VALUES (?,?) '
+                 'ON CONFLICT(key) DO UPDATE SET value = excluded.value'),
             (key, json.dumps(value)),
         )
-        connection.commit()
 
 
 # ── Seeding ───────────────────────────────────────────────────────────────────
