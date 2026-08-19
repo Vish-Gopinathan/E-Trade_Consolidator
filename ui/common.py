@@ -69,10 +69,23 @@ def render_sidebar_status() -> None:
     elif st.session_state.get('_is_snapshot'):
         snapshot_date = portfolio.get('snapshot_date', fetched_at[:10])
         st.info(f'📅 Snapshot — {snapshot_date}')
+    elif portfolio and _from_database():
+        # Distinguished from the local cache on purpose: this is the shared
+        # copy, so it is what every device sees, and it says as of when.
+        st.info(f'🗄️ Database — {fetched_at[:10] or "date unknown"}')
     elif portfolio:
         st.warning(f'🟡 Cached — {fetched_at[:10] or "date unknown"}')
     else:
         st.error('🔴 No data — connect E\\*TRADE to load')
+
+
+def _from_database() -> bool:
+    """Whether the ledger and holdings are being read from a remote database."""
+    try:
+        from portfolio.storage import db
+        return db.is_remote()
+    except Exception:
+        return False
 
 
 def require_portfolio(key: str | None = None):

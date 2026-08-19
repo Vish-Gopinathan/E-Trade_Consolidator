@@ -27,7 +27,7 @@ load_dotenv(paths.ROOT / '.env')
 # only thing that assembles a portfolio dict — so the refresh and a rebuild
 # cannot produce differently-shaped results.
 from portfolio import build, etrade, excel, schema                # noqa: E402
-from portfolio.storage import cache, holdings_store, ledger, snapshot  # noqa: E402
+from portfolio.storage import cache, db, holdings_store, ledger, snapshot  # noqa: E402
 from ui.common import get_secret, is_guest, money, render_sidebar_status  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -574,20 +574,51 @@ if st.session_state.get('authenticated'):
 else:
     _login_gate()
 
-if 'portfolio' not in st.session_state:
+def _load_stored_portfolio():
+    """
+    Find data to open with, without contacting E*TRADE.
+
+    Order matters, and it changes with the deployment:
+
+    * **A database is configured** — it wins. It is the shared copy, so a
+      refresh done on one machine is what every other machine should see. The
+      local JSON cache would otherwise serve yesterday's numbers on the laptop
+      after a refresh from a phone.
+    * **Otherwise** — the local cache, then a snapshot. Both live in ``data/``,
+      which is exactly what a hosted container does not keep, and why relying on
+      them alone left a fresh deployment showing an empty page and a login
+      prompt however much data was actually stored.
+    """
+    if db.is_remote():
+        try:
+            with st.spinner('Loading your portfolio…'):
+                return build.rebuild_from_stored(), False
+        except Exception as exc:
+            LOGGER.exception('rebuild from the database failed')
+            st.warning(f'Could not read the stored portfolio: {exc}')
+
     try:
         cached = cache.load_portfolio()
     except Exception:
         LOGGER.exception('cache read failed')
         cached = None
     if cached:
-        st.session_state.portfolio = cached
-    elif snapshot.exists():
+        return cached, False
+
+    if snapshot.exists():
         try:
-            st.session_state.portfolio = snapshot.load()
-            st.session_state._is_snapshot = True
+            return snapshot.load(), True
         except Exception:
             LOGGER.exception('snapshot read failed')
+    return None, False
+
+
+if 'portfolio' not in st.session_state:
+    portfolio, is_snapshot = _load_stored_portfolio()
+    if portfolio:
+        st.session_state.portfolio = portfolio
+        if is_snapshot:
+            st.session_state._is_snapshot = True
 
 with st.sidebar:
     _render_sidebar()
