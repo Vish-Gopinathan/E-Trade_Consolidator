@@ -53,6 +53,13 @@ DEPOSIT_ADJUSTED_RETURN_PCT = 'Deposit-Adjusted Return (%)'
 #: beside it — the approximation is material and the reader deserves to know.
 DEPOSIT_ADJUSTED_RETURN_BASIS = 'Deposit-Adjusted Return Basis'
 
+#: Money-weighted annual growth rate (XIRR): the constant yearly rate that turns
+#: each deposit, on the day it was made, into today's balance. Distinct from
+#: DEPOSIT_ADJUSTED_RETURN_PCT, which is cumulative over the whole period and so
+#: says nothing about pace. None when the history is too short to annualise.
+ANNUALISED_RETURN_PCT = 'Annualised Return (%)'
+ANNUALISED_RETURN_BASIS = 'Annualised Return Basis'
+
 # ── Concentration ─────────────────────────────────────────────────────────────
 
 HHI = 'HHI Score'                          # 0–10000; higher is more concentrated

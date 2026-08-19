@@ -13,7 +13,7 @@ import streamlit as st
 
 from portfolio import schema
 from ui import theme
-from ui.common import money, page_header, percent, require_portfolio
+from ui.common import md, money, page_header, percent, require_portfolio
 
 page_header('Performance', '🎯')
 
@@ -34,7 +34,7 @@ trading = report.get(schema.TRADING, {})
 
 st.subheader('Returns')
 
-r1, r2, r3, r4 = st.columns(4)
+r1, r2, r3, r4, r5 = st.columns(5)
 r1.metric('Cost Basis', money(performance.get(schema.COST_BASIS), 0))
 r2.metric('Portfolio Value', money(performance.get(schema.MARKET_VALUE), 0))
 r3.metric(
@@ -45,17 +45,28 @@ r4.metric(
     'Deposit-Adj. Return',
     percent(performance.get(schema.DEPOSIT_ADJUSTED_RETURN_PCT)),
 )
+# The two adjusted figures answer different questions and are easy to conflate:
+# one is the whole period, the other is per year. Labelled so the difference is
+# visible without reading the captions.
+annualised = performance.get(schema.ANNUALISED_RETURN_PCT)
+r5.metric('Annual Growth Rate', percent(annualised))
+r5.caption('per year' if annualised is not None else 'needs 1 year of history')
 
-basis = performance.get(schema.DEPOSIT_ADJUSTED_RETURN_BASIS)
-if basis:
-    # The approximation is material enough that it belongs on the page, not in a
-    # tooltip — a reader who does not know it can misread the number badly.
-    st.caption(f'ℹ️ {basis}')
+for key in (schema.DEPOSIT_ADJUSTED_RETURN_BASIS, schema.ANNUALISED_RETURN_BASIS):
+    basis = performance.get(key)
+    if basis:
+        # These approximations are material enough to belong on the page rather
+        # than in a tooltip — a reader who does not know them can misread the
+        # numbers badly.
+        st.caption(md(f'ℹ️ {basis}'))
 
 st.caption(
     'Unrealised gain compares current positions to what was paid for them and '
-    'excludes cash from both sides. Deposit-adjusted return removes the effect of '
-    'when you added or withdrew money, so contributions do not read as performance.'
+    'excludes cash from both sides. **Deposit-adjusted return** is cumulative — '
+    'the whole period, however long that is. **Annual growth rate** is the same '
+    'money expressed as a yearly rate, which is the form comparable to a savings '
+    'rate or an index. Both remove the effect of when you added money, so '
+    'contributions do not read as performance.'
 )
 
 st.markdown('---')

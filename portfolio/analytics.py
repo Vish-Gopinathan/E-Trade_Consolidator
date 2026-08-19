@@ -20,7 +20,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from portfolio import paths, schema
+from portfolio import paths, returns, schema
 
 LOGGER = logging.getLogger(__name__)
 
@@ -142,11 +142,24 @@ class PortfolioAnalytics:
             schema.DEPOSIT_ADJUSTED_RETURN_BASIS: (
                 'No external cash flows in range, so no adjustment was applied.'
             ),
+            schema.ANNUALISED_RETURN_PCT: None,
+            schema.ANNUALISED_RETURN_BASIS: (
+                'No deposits or withdrawals on record to measure growth against.'
+            ),
         }
 
         flows = self._signed_cash_flows()
         if flows.empty:
             return result
+
+        # Money-weighted annual rate. Deposit-adjusted return says how much was
+        # made; this says how fast, which is the only form comparable to a
+        # savings rate or an index.
+        annual = returns.annualised_return(
+            zip(flows['Date'], flows['Total Value']), portfolio_value
+        )
+        result[schema.ANNUALISED_RETURN_PCT] = annual['rate_pct']
+        result[schema.ANNUALISED_RETURN_BASIS] = annual['basis']
 
         net_flow = float(flows['Total Value'].sum())
         dates = pd.to_datetime(flows['Date'])
