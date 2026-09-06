@@ -14,11 +14,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
-from ui.common import is_guest, page_header, require_portfolio, signed_money
+from ui.common import is_guest, md, page_header, require_portfolio, signed_money
 from portfolio.storage import prices as ps
 from portfolio import symbols as sr
 from portfolio import history as ph
-from ui import theme as vt
+from ui import rebuild, theme as vt
 from portfolio import paths
 
 page_header(
@@ -37,15 +37,15 @@ anchor = ph.anchor_date(portfolio)
 
 # ── Symbol resolution ─────────────────────────────────────────────────────────
 
-all_trades = ph.trade_rows(transactions_df)
-if all_trades.empty:
+resolution = rebuild.resolve(portfolio)
+if resolution.empty:
     st.info('No buy/sell transactions found, so there is no position history to rebuild.')
     st.stop()
 
-manual_map = sr.load_map()
-trades, unresolved, sources = sr.resolve_trades(all_trades, holdings_df, manual_map)
-
-first_txn = pd.to_datetime(all_trades['Date']).min().date()
+all_trades = resolution.all_trades
+trades, unresolved, sources = resolution.trades, resolution.unresolved, resolution.sources
+manual_map = resolution.manual_map
+first_txn = resolution.first_trade
 
 
 def _sector_groups():
@@ -105,35 +105,9 @@ if start_date >= end_date:
 
 # ── Build (cached by input signature) ─────────────────────────────────────────
 
-signature = (
-    portfolio.get('fetched_at', ''), str(start_date), str(end_date),
-    len(trades), json.dumps(manual_map, sort_keys=True),
+result, store = rebuild.daily_history(
+    portfolio, resolution, start_date, end_date, key='_hist',
 )
-
-if st.session_state.get('_hist_signature') != signature:
-    symbols = sorted(
-        set(ph.current_shares(holdings_df).index) | (set(trades['Symbol']) - {''})
-    )
-    bar = st.progress(0.0, text='Preparing…')
-    try:
-        store = ps.ensure(
-            symbols, start_date, anchor,
-            progress=lambda f, m: bar.progress(min(f, 1.0), text=m),
-        )
-        store = ps.ensure_metadata(
-            symbols, progress=lambda f, m: bar.progress(min(f, 1.0), text=m),
-        )
-        bar.progress(1.0, text='Rebuilding daily values…')
-        result = ph.reconstruct(portfolio, trades, store, start_date, end_date, ps)
-    finally:
-        bar.empty()
-
-    st.session_state['_hist_signature'] = signature
-    st.session_state['_hist_result'] = result
-    st.session_state['_hist_store'] = store
-
-result = st.session_state['_hist_result']
-store = st.session_state['_hist_store']
 
 if result.total.empty:
     st.warning('No trading days fall inside the selected range.')
@@ -216,7 +190,10 @@ peak_note = (
     f"low **${stats['trough_value']:,.0f}** on {stats['trough_date']:%b %d, %Y} · "
     f"{len(series):,} trading days"
 )
-st.caption(peak_note)
+# Two amounts in one caption: Streamlit reads everything between the two
+# dollar signs as inline LaTeX, so this line rendered the peak, the low and the
+# words between them as a serif maths expression.
+st.caption(md(peak_note))
 
 # ── Breakdown ─────────────────────────────────────────────────────────────────
 
@@ -546,7 +523,7 @@ if unresolved:
                             if sym:
                                 updated[row['Description']] = sym
                         sr.save_map(updated)
-                        st.session_state.pop('_hist_signature', None)
+                        rebuild.invalidate('_hist')
                         st.session_state.pop('_hist_proposals', None)
                         st.success(f'Saved {len(updated)} mapping(s). Rebuilding…')
                         st.rerun()
@@ -572,7 +549,7 @@ if unresolved:
                     updated = dict(manual_map)
                     updated[pick] = ticker
                     sr.save_map(updated)
-                    st.session_state.pop('_hist_signature', None)
+                    rebuild.invalidate('_hist')
                     st.rerun()
 
 # ── Methodology ───────────────────────────────────────────────────────────────
@@ -622,5 +599,5 @@ with st.expander('🗄️ Price cache'):
         st.dataframe(cov_df, use_container_width=True, hide_index=True, height=240)
     if not is_guest() and st.button('♻️ Clear price cache and refetch'):
         ps.clear()
-        st.session_state.pop('_hist_signature', None)
+        rebuild.invalidate('_hist')
         st.rerun()

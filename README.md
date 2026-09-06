@@ -3,8 +3,10 @@
 A private dashboard that pulls holdings, balances and transaction history from
 every active E\*TRADE account, merges them into one view, and answers the
 questions a brokerage statement does not: how much of the gain is real
-performance rather than money you added, where the portfolio is concentrated,
-what it was worth on any past day, and whether selling was the right call.
+performance rather than money you added, how the investments did year to date or
+over the last three months with deposits and withdrawals divided out, where the
+portfolio is concentrated, what it was worth on any past day, and whether selling
+was the right call.
 
 Runs locally against your own account. No portfolio data is ever sent anywhere.
 
@@ -44,7 +46,7 @@ python cli.py --start 2024-01-01 --output-dir outputs/
 | Portfolio | Overview | What is it worth, and where did the numbers come from |
 | | Holdings | Every position, allocation, gain and loss |
 | | Value Over Time | What it was worth on any past day, rebuilt from transactions |
-| | Performance | Return with contributions factored out; concentration; sector mix |
+| | Performance | Return year to date, over three months, by calendar year — deposits divided out; concentration; sector mix |
 | Money | Cash Flows & Income | Deposits, withdrawals, dividends — and the transfer review |
 | | Transactions | The full history, filterable, with how each row was classified |
 | Research | Earnings | Next report date and EPS estimate per holding; how recent ones landed |

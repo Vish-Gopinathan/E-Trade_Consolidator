@@ -182,6 +182,27 @@ residual in the earliest dates. Do not switch to a forward walk: it would put th
 error on the most recent, most scrutinised numbers. Everything is on today's split
 basis.
 
+**Period returns** (`portfolio/periods.py`) are time-weighted, and that is the
+opposite choice from `returns.py` on purpose. XIRR counts *when* money was added
+because the deposit timing was the owner's decision; a period return must not,
+because "how did this do since January" is a question about the investments and a
+February deposit is noise in it. Both belong on the page, and the page says which
+is which.
+
+The chain divides by each day's **opening** balance, so anything at or below
+`DORMANT_FLOOR` is not a small denominator, it is a broken one. Leading ones are
+skipped (the account had not started); the rest refuse the period. The demo makes
+this concrete: it trades from 2001 with cash flows from 2010, so the backward cash
+walk reconstructs a **negative** balance for nine years. Divided into naively,
+every one of those years reported a confident 0.0% — indistinguishable from a year
+the portfolio genuinely went nowhere. A period the data cannot reach is dropped
+rather than shown short, for the same reason: "5 years" over three years of
+history is a claim about a period nobody measured.
+
+`ui/rebuild.py` exists so Value Over Time and Performance rest on one
+reconstruction rather than two. When the same figure is computed twice here, the
+drift is silent — see rule 2.
+
 **Charts** (`ui/theme.py`) use one validated palette. The green/red diverging pair
 measures ΔE 7.2 for protanopia, inside the band that is only permissible with a
 second, non-colour encoding — so those charts must also carry position against a
@@ -193,7 +214,7 @@ largest holding.
 ## Working here
 
 ```bash
-pytest                          # 70 tests, ~4s
+pytest                          # ~190 tests, ~5s
 streamlit run demo.py           # exercise the UI without real credentials
 python cli.py --help
 ```
