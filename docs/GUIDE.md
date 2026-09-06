@@ -112,6 +112,13 @@ dates. **Data quality** reports those residuals rather than absorbing them.
 Returns, concentration, sector mix, and the spread of position outcomes. See
 [metrics](#what-each-metric-means).
 
+**Performance over time** is the part that answers "how did this do since
+January". It reports a time-weighted return for the standard trailing periods and
+for each calendar year, with deposits and withdrawals divided out, so a large
+contribution does not read as a good quarter. A period the reconstructed history
+cannot reach is left out rather than shown short — see
+[time-weighted return](#time-weighted-return-per-period).
+
 ### Cash Flows & Income
 Deposits and withdrawals, dividends and interest, and **Transfer Review** — the
 transfers the app could not classify alone. See [classification](#how-money-is-classified).
@@ -239,6 +246,64 @@ so beneath it.
 
 Do not compare it to a fund's published return: it is money-weighted (it reflects
 your timing), while fund returns are time-weighted (they do not).
+
+### Time-weighted return (per period)
+
+"How did the investments do between these two dates", with the size of the
+balance — and therefore every deposit and withdrawal — divided out. Each day is a
+sub-period::
+
+    r(d) = (value at close − external flow that day) / value at previous close − 1
+
+and the daily factors are multiplied together. Because every link divides by that
+day's own opening balance, a balance that doubles overnight from a deposit leaves
+the return untouched.
+
+This is the figure that is **comparable to a published index**, which the other
+two returns on that page are not: they count the timing of your deposits on
+purpose, and an index has no deposits. Dividends and interest stay in — they are
+return, not contributions — and cash is included in the balance, because a
+deposit lands as cash and measuring positions alone would read it as a loss. An
+idle cash pile therefore drags these numbers down, which is a real property of
+the portfolio rather than an artefact.
+
+Flows are assumed to arrive at the **close** of their day, so they do not earn
+that day's return. E\*TRADE dates a transfer to the day rather than the minute,
+so assuming the open would be equally arbitrary; the choice affects only the one
+day.
+
+Three things are deliberately refused rather than approximated:
+
+- **A period longer than the data.** Three years of history under a "5 years"
+  heading is a statement about a period nobody measured, so that row is dropped.
+  "Since ⟨month⟩" names its own start date and covers whatever there is.
+- **A negative reconstructed balance.** The cash walk runs backwards from today,
+  so on an account whose transaction feed does not reach its opening the balance
+  goes negative in the earliest years. Dividing by a large negative number
+  produces a confident 0.0% that looks exactly like a flat year. Those years are
+  left out, and the page says how many days were skipped.
+- **A day that closed worth less than the money recorded as arriving in it.** A
+  return below −100% is impossible, so this means a transaction is missing or
+  misclassified. The period is left blank with that explanation.
+
+**Return and market gain can disagree in sign,** and that is the point of showing
+both. The dollar figure counts when the money was in the account; the percentage
+deliberately does not. A year that fell while the balance was small and recovered
+after a large deposit ends up ahead in dollars while every dollar invested
+throughout it lost ground.
+
+**Volatility** beside these returns is the annualised standard deviation of the
+same daily returns. Unlike the [spread of returns](#spread-of-returns) further
+down that page, this one is computed over a genuine time series, so it means what
+it says. There is still no Sharpe ratio: that needs a risk-free rate the app does
+not have.
+
+Everything here inherits the accuracy of
+[portfolio history](#portfolio-history), which is exact today by construction and
+looser the further back it reaches — so the short periods are the most
+trustworthy figures on the page and the longest the least. **How far to trust
+these numbers** on the page itself lists what the current data does and does not
+support.
 
 ### Concentration
 
